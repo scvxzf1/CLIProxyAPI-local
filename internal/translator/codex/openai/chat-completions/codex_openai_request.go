@@ -305,7 +305,11 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 			// Pass through built-in tools (e.g. {"type":"web_search"}) directly for the Responses API.
 			// Only "function" needs structural conversion because Chat Completions nests details under "function".
 			if toolType != "" && toolType != "function" && t.IsObject() {
-				out, _ = sjson.SetRawBytes(out, "tools.-1", []byte(t.Raw))
+				toolRaw := []byte(t.Raw)
+				if normalized := normalizeCodexChatBuiltinToolType(toolType); normalized != "" {
+					toolRaw, _ = sjson.SetBytes(toolRaw, "type", normalized)
+				}
+				out, _ = sjson.SetRawBytes(out, "tools.-1", toolRaw)
 				continue
 			}
 
@@ -364,7 +368,11 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 				out, _ = sjson.SetRawBytes(out, "tool_choice", choice)
 			} else if tcType != "" {
 				// Built-in tool choices (e.g. {"type":"web_search"}) are already Responses-compatible.
-				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(tc.Raw))
+				choiceRaw := []byte(tc.Raw)
+				if normalized := normalizeCodexChatBuiltinToolType(tcType); normalized != "" {
+					choiceRaw, _ = sjson.SetBytes(choiceRaw, "type", normalized)
+				}
+				out, _ = sjson.SetRawBytes(out, "tool_choice", choiceRaw)
 			}
 		}
 	}
@@ -534,4 +542,15 @@ func buildShortNameMap(names []string) map[string]string {
 		m[n] = uniq
 	}
 	return m
+}
+
+// normalizeCodexChatBuiltinToolType rewrites legacy/preview built-in tool aliases to the
+// stable Codex Responses names (mirrors the responses-path helper).
+func normalizeCodexChatBuiltinToolType(toolType string) string {
+	switch toolType {
+	case "web_search_preview", "web_search_preview_2025_03_11":
+		return "web_search"
+	default:
+		return ""
+	}
 }

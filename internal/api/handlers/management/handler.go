@@ -55,6 +55,9 @@ type Handler struct {
 	postAuthHook            coreauth.PostAuthHook
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
+	usageKeeperStatus       func() map[string]any
+	usageKeeperEnsure       func(managementKey string) map[string]any
+	usageKeeperCapture      func(managementKey string)
 	configReloadHook        func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
@@ -138,6 +141,64 @@ func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
 	h.mu.Lock()
 	h.authManager = manager
 	h.mu.Unlock()
+}
+
+// SetUsageKeeperStatusProvider registers a callback that reports embedded usage-keeper status.
+func (h *Handler) SetUsageKeeperStatusProvider(provider func() map[string]any) {
+	if h == nil {
+		return
+	}
+	h.usageKeeperStatus = provider
+}
+
+// SetUsageKeeperEnsureProvider registers a callback that starts usage-keeper using the
+// current management request key (so the UI never needs a separate URL/key form).
+func (h *Handler) SetUsageKeeperEnsureProvider(provider func(managementKey string) map[string]any) {
+	if h == nil {
+		return
+	}
+	h.usageKeeperEnsure = provider
+}
+
+// SetUsageKeeperCaptureProvider registers a callback that stores the current management key
+// so the embedded usage-keeper sidecar stays in sync without manual config edits.
+func (h *Handler) SetUsageKeeperCaptureProvider(provider func(managementKey string)) {
+	if h == nil {
+		return
+	}
+	h.usageKeeperCapture = provider
+}
+
+// GetUsageKeeperStatus returns whether the embedded CPA Usage Keeper sidecar is available.
+// When the sidecar is enabled but not running, it reuses the current management Authorization
+// bearer key to bootstrap the process automatically.
+func (h *Handler) GetUsageKeeperStatus(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
+		return
+	}
+	provided := strings.TrimSpace(c.GetHeader("Authorization"))
+	if len(provided) > 7 && strings.EqualFold(provided[:7], "Bearer ") {
+		provided = strings.TrimSpace(provided[7:])
+	}
+	if provided != "" && h.usageKeeperEnsure != nil {
+		status := h.usageKeeperEnsure(provided)
+		if status == nil {
+			status = map[string]any{"enabled": false, "running": false}
+		}
+		c.JSON(http.StatusOK, status)
+		return
+	}
+	if h.usageKeeperStatus == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "running": false})
+		return
+	}
+	status := h.usageKeeperStatus()
+	if status == nil {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "running": false})
+		return
+	}
+	c.JSON(http.StatusOK, status)
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
@@ -290,6 +351,12 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		if !allowed {
 			c.AbortWithStatusJSON(statusCode, gin.H{"error": errMsg})
 			return
+		}
+		// Keep embedded usage-keeper credentials synced with the live management key.
+		if h.usageKeeperCapture != nil {
+			if key := strings.TrimSpace(provided); key != "" {
+				h.usageKeeperCapture(key)
+			}
 		}
 		c.Next()
 	}

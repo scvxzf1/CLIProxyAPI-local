@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -152,4 +153,51 @@ func firstAuthFileEntry(t *testing.T, h *Handler) map[string]any {
 		t.Fatalf("expected file entry object, got %#v", filesRaw[0])
 	}
 	return fileEntry
+}
+
+func TestListAuthFiles_MasksAPIKeyAccount(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	authDir := t.TempDir()
+	fileName := "openai-compat-key.json"
+	filePath := filepath.Join(authDir, fileName)
+	if errWrite := os.WriteFile(filePath, []byte(`{"type":"openai-compatibility","api_key":"sk-test-secret-key-123456"}`), 0o600); errWrite != nil {
+		t.Fatalf("failed to write auth file: %v", errWrite)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "openai-compatibility",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path":    filePath,
+			"api_key": "sk-test-secret-key-123456",
+		},
+		Metadata: map[string]any{
+			"type": "openai-compatibility",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	entry := firstAuthFileEntry(t, h)
+	if got := entry["account_type"]; got != "api_key" {
+		t.Fatalf("expected account_type %q, got %#v", "api_key", got)
+	}
+	gotAccount, _ := entry["account"].(string)
+	if gotAccount == "sk-test-secret-key-123456" {
+		t.Fatalf("account still contains full API key: %q", gotAccount)
+	}
+	if !strings.Contains(gotAccount, "...") {
+		t.Fatalf("expected masked account value, got %q", gotAccount)
+	}
+	if strings.Contains(gotAccount, "secret-key") {
+		t.Fatalf("masked account still leaks middle of API key: %q", gotAccount)
+	}
 }

@@ -3,7 +3,7 @@
 host: ""
 
 # Server port
-port: 8317
+port: 8318
 
 # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.
 tls:
@@ -101,6 +101,24 @@ usage-statistics-enabled: false
 # The local Redis RESP usage output is disabled.
 # Default: 60. Max: 3600.
 redis-usage-queue-retention-seconds: 60
+
+# Embedded CPA Usage Keeper (https://github.com/Willxup/cpa-usage-keeper)
+# When enabled, CPA starts the sidecar and serves it at /usage-keeper/ for the management UI.
+usage-keeper:
+  enabled: false
+  # Path to cpa-usage-keeper binary. Empty looks under ./usage-keeper/cpa-usage-keeper and PATH.
+  binary: ""
+  # Sidecar data directory. Empty defaults to <config-dir>/usage-keeper-data.
+  work-dir: ""
+  # Loopback listen address for the sidecar process.
+  listen-addr: "127.0.0.1:18080"
+  # Optional bootstrap key only. Prefer leaving empty: CPA auto-syncs from the current
+  # management login key (and restarts Keeper when that password changes).
+  # You can still set CPA_USAGE_KEEPER_MANAGEMENT_KEY / MANAGEMENT_PASSWORD as fallback.
+  management-key: ""
+  # Optional Keeper dashboard password protection.
+  auth-enabled: false
+  login-password: ""
 
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.

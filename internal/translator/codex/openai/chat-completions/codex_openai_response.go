@@ -29,6 +29,7 @@ type ConvertCliToOpenAIParams struct {
 	HasReceivedArgumentsDelta bool
 	HasToolCallAnnounced      bool
 	LastImageHashByItemID     map[string][32]byte
+	WebSearchSeenIDs          map[string]struct{}
 }
 
 // ConvertCodexResponseToOpenAI translates a single chunk of a streaming response from the
@@ -262,6 +263,34 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 			template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
 			return [][]byte{template}
 		}
+		if itemType == "web_search_call" {
+			p := (*param).(*ConvertCliToOpenAIParams)
+			id := strings.TrimSpace(itemResult.Get("id").String())
+			if id == "" {
+				id = strings.TrimSpace(itemResult.Get("call_id").String())
+			}
+			if id != "" {
+				if p.WebSearchSeenIDs == nil {
+					p.WebSearchSeenIDs = make(map[string]struct{})
+				}
+				if _, ok := p.WebSearchSeenIDs[id]; ok {
+					return [][]byte{}
+				}
+				p.WebSearchSeenIDs[id] = struct{}{}
+			}
+			annotations, summary := codexWebSearchAnnotationsAndSummary(itemResult)
+			if len(annotations) == 0 && summary == "" {
+				return [][]byte{}
+			}
+			template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+			if summary != "" {
+				template, _ = sjson.SetBytes(template, "choices.0.delta.content", summary)
+			}
+			if len(annotations) > 0 {
+				template, _ = sjson.SetRawBytes(template, "choices.0.delta.annotations", annotations)
+			}
+			return [][]byte{template}
+		}
 		if itemType != "function_call" {
 			return [][]byte{}
 		}
@@ -365,11 +394,14 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 	// Process the output array for content and function calls
 	var toolCalls [][]byte
 	var images [][]byte
+	var annotations [][]byte
 	outputResult := responseResult.Get("output")
 	if outputResult.IsArray() {
 		outputArray := outputResult.Array()
 		var contentText string
 		var reasoningText string
+		var webSearchSummaries []string
+		webSearchSeen := make(map[string]struct{})
 
 		for _, outputItem := range outputArray {
 			outputType := outputItem.Get("type").String()
@@ -400,6 +432,28 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 							break
 						}
 					}
+				}
+			case "web_search_call":
+				id := strings.TrimSpace(outputItem.Get("id").String())
+				if id == "" {
+					id = strings.TrimSpace(outputItem.Get("call_id").String())
+				}
+				if id != "" {
+					if _, ok := webSearchSeen[id]; ok {
+						break
+					}
+					webSearchSeen[id] = struct{}{}
+				}
+				itemAnnotations, summary := codexWebSearchAnnotationsAndSummary(outputItem)
+				if len(itemAnnotations) > 0 {
+					// Flatten into message-level annotations array.
+					arr := gjson.ParseBytes(itemAnnotations).Array()
+					for _, ann := range arr {
+						annotations = append(annotations, []byte(ann.Raw))
+					}
+				}
+				if summary != "" {
+					webSearchSummaries = append(webSearchSummaries, strings.TrimSpace(summary))
 				}
 			case "function_call":
 				// Handle function call content
@@ -439,9 +493,21 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 			}
 		}
 
+		// Preserve web search provenance when the model only returns sources.
+		if contentText == "" && len(webSearchSummaries) > 0 {
+			contentText = strings.Join(webSearchSummaries, "\n")
+		}
+
 		// Set content and reasoning content if found
 		if contentText != "" {
 			template, _ = sjson.SetBytes(template, "choices.0.message.content", contentText)
+			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
+		}
+		if len(annotations) > 0 {
+			template, _ = sjson.SetRawBytes(template, "choices.0.message.annotations", []byte(`[]`))
+			for _, ann := range annotations {
+				template, _ = sjson.SetRawBytes(template, "choices.0.message.annotations.-1", ann)
+			}
 			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
 		}
 
@@ -535,4 +601,60 @@ func mimeTypeFromCodexOutputFormat(outputFormat string) string {
 	default:
 		return "image/png"
 	}
+}
+
+func codexWebSearchAnnotationsAndSummary(item gjson.Result) ([]byte, string) {
+	results := firstCodexChatWebSearchResults(item)
+	if !results.IsArray() || results.Get("#").Int() == 0 {
+		query := strings.TrimSpace(item.Get("action.query").String())
+		if query == "" {
+			query = strings.TrimSpace(item.Get("query").String())
+		}
+		if query == "" {
+			return nil, ""
+		}
+		return nil, "Web search: " + query
+	}
+
+	annotations := []byte(`[]`)
+	var lines []string
+	seen := make(map[string]struct{})
+	results.ForEach(func(_, result gjson.Result) bool {
+		url := strings.TrimSpace(result.Get("url").String())
+		if url == "" {
+			url = strings.TrimSpace(result.Get("link").String())
+		}
+		if url == "" {
+			return true
+		}
+		if _, ok := seen[url]; ok {
+			return true
+		}
+		seen[url] = struct{}{}
+		title := strings.TrimSpace(result.Get("title").String())
+		if title == "" {
+			title = url
+		}
+		ann := []byte(`{"type":"url_citation","url":"","title":""}`)
+		ann, _ = sjson.SetBytes(ann, "url", url)
+		ann, _ = sjson.SetBytes(ann, "title", title)
+		annotations, _ = sjson.SetRawBytes(annotations, "-1", ann)
+		lines = append(lines, "- "+title+": "+url)
+		return true
+	})
+	if len(seen) == 0 {
+		return nil, ""
+	}
+	summary := "Web search results:\n" + strings.Join(lines, "\n")
+	return annotations, summary
+}
+
+func firstCodexChatWebSearchResults(item gjson.Result) gjson.Result {
+	for _, path := range []string{"results", "action.sources", "sources", "action.results"} {
+		results := item.Get(path)
+		if results.IsArray() && results.Get("#").Int() > 0 {
+			return results
+		}
+	}
+	return gjson.Result{}
 }

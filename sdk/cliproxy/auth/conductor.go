@@ -86,7 +86,10 @@ const (
 	refreshIneffectiveBackoff = 30 * time.Second
 	quotaBackoffBase          = time.Second
 	quotaBackoffMax           = 30 * time.Minute
-	transientErrorCooldown    = time.Minute
+	// freeUsageQuotaCooldown is used for subscription free-tier exhaustion errors that
+	// reset over a rolling 24-hour window (e.g. Grok free-usage-exhausted).
+	freeUsageQuotaCooldown = 23 * time.Hour
+	transientErrorCooldown = time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -171,6 +174,8 @@ type Result struct {
 	RetryAfter *time.Duration
 	// Error describes the failure when Success is false.
 	Error *Error
+	// Headers carries optional upstream response headers used for free-usage snapshots.
+	Headers http.Header
 }
 
 // Selector chooses an auth candidate for execution.
@@ -1763,7 +1768,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr, Headers: headersFromError(chunk.Err)})
 			}
 			if !forward {
 				return false
@@ -1820,7 +1825,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true, Headers: headers.Clone()})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -1865,6 +1870,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
+			result.Headers = headersFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
@@ -1904,6 +1910,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				result.Headers = headersFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
@@ -1915,6 +1922,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
+				result.Headers = headersFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
@@ -1926,6 +1934,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
+			result.Headers = headersFromError(bootstrapErr)
 			m.MarkResult(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
@@ -2611,6 +2620,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				result.Headers = headersFromError(errExec)
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
@@ -2618,6 +2628,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			result.Headers = resp.Headers.Clone()
 			m.MarkResult(execCtx, result)
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
@@ -2730,6 +2741,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
+				result.Headers = headersFromError(errExec)
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
@@ -2737,6 +2749,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				authErr = errExec
 				continue
 			}
+			result.Headers = resp.Headers.Clone()
 			m.MarkResult(execCtx, result)
 			rewriteForceMappedResponse(&resp, aliasResult)
 			return resp, nil
@@ -3702,6 +3715,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			} else {
 				clearAuthStateOnSuccess(auth, now)
 			}
+			applyFreeUsageSnapshot(auth, result.Model, result.Headers, nil, now)
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
@@ -3776,9 +3790,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
+							quotaReason := "quota"
 							if !disableCooling {
 								if result.RetryAfter != nil {
 									next = now.Add(*result.RetryAfter)
+								} else if isFreeUsageExhaustedResultError(result.Error) {
+									// Free-tier rolling windows last ~24h; avoid short exponential
+									// backoff that immediately reselects the exhausted credential.
+									next = now.Add(freeUsageQuotaCooldown)
+									quotaReason = "free_usage_exhausted"
 								} else {
 									next, backoffLevel = quotaCooldownAfterFailure(state.Quota, now)
 								}
@@ -3786,7 +3806,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
 								Exceeded:      true,
-								Reason:        "quota",
+								Reason:        quotaReason,
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
@@ -3816,6 +3836,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		if !result.Success {
+			applyFreeUsageSnapshot(auth, result.Model, result.Headers, result.Error, now)
+		}
 		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 		if trackCooldownState {
@@ -4195,6 +4218,272 @@ func isCloudflareChallengeResultError(err *Error) bool {
 	return isCloudflareChallengeErrorMessage(err.Message)
 }
 
+func isFreeUsageExhaustedErrorMessage(message string) bool {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" {
+		return false
+	}
+	if strings.Contains(lower, "subscription:free-usage-exhausted") ||
+		strings.Contains(lower, "free-usage-exhausted") {
+		return true
+	}
+	return strings.Contains(lower, "included free usage") && strings.Contains(lower, "rolling 24-hour")
+}
+
+func isFreeUsageExhaustedResultError(err *Error) bool {
+	if err == nil {
+		return false
+	}
+	if isFreeUsageExhaustedErrorMessage(err.Code) || isFreeUsageExhaustedErrorMessage(err.Message) {
+		return true
+	}
+	return false
+}
+
+// freeUsageErrorMessage extracts a human-readable free-usage exhaustion message.
+// Prefer the nested error text when the payload is a JSON envelope.
+func freeUsageErrorMessage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "{") {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err == nil {
+			for _, key := range []string{"error", "message", "msg"} {
+				switch v := payload[key].(type) {
+				case string:
+					if msg := strings.TrimSpace(v); msg != "" {
+						return msg
+					}
+				case map[string]any:
+					for _, nestedKey := range []string{"message", "error", "msg"} {
+						if msg, ok := v[nestedKey].(string); ok {
+							if trimmed := strings.TrimSpace(msg); trimmed != "" {
+								return trimmed
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return raw
+}
+
+func applyFreeUsageSnapshot(auth *Auth, model string, headers http.Header, err *Error, now time.Time) {
+	if auth == nil {
+		return
+	}
+	snapshot := freeUsageSnapshotFromResult(model, headers, err, now)
+	if snapshot == nil {
+		return
+	}
+	if auth.FreeUsage == nil {
+		auth.FreeUsage = snapshot
+		SyncFreeUsageToMetadata(auth)
+		return
+	}
+	// Prefer newer snapshots, but keep token limit/used from error body when headers omit used counts.
+	merged := *auth.FreeUsage
+	if snapshot.Model != "" {
+		merged.Model = snapshot.Model
+	}
+	if snapshot.LimitTokens > 0 {
+		merged.LimitTokens = snapshot.LimitTokens
+	}
+	if snapshot.UsedTokens > 0 {
+		merged.UsedTokens = snapshot.UsedTokens
+	}
+	if snapshot.RemainingTokens != nil {
+		v := *snapshot.RemainingTokens
+		merged.RemainingTokens = &v
+		if merged.LimitTokens > 0 && merged.UsedTokens == 0 {
+			used := merged.LimitTokens - v
+			if used < 0 {
+				used = 0
+			}
+			merged.UsedTokens = used
+		}
+	}
+	if snapshot.LimitRequests > 0 {
+		merged.LimitRequests = snapshot.LimitRequests
+	}
+	if snapshot.RemainingRequests != nil {
+		v := *snapshot.RemainingRequests
+		merged.RemainingRequests = &v
+	}
+	if snapshot.Window != "" {
+		merged.Window = snapshot.Window
+	}
+	// Only error snapshots can mark exhausted; a later success clears it.
+	if err == nil {
+		merged.Exhausted = false
+		if merged.Source != "error_body" {
+			merged.Message = ""
+		}
+	} else if snapshot.Exhausted {
+		merged.Exhausted = true
+	}
+	if snapshot.Message != "" {
+		merged.Message = snapshot.Message
+	}
+	if snapshot.Source != "" {
+		merged.Source = snapshot.Source
+	}
+	merged.ObservedAt = snapshot.ObservedAt
+	auth.FreeUsage = &merged
+	SyncFreeUsageToMetadata(auth)
+}
+
+func freeUsageSnapshotFromResult(model string, headers http.Header, err *Error, now time.Time) *FreeUsageState {
+	snapshot := &FreeUsageState{
+		Model:      strings.TrimSpace(model),
+		Window:     "rolling_24h",
+		ObservedAt: now,
+	}
+	hasData := false
+	if headers != nil {
+		if limitTokens := headerInt64Value(headers, "x-ratelimit-limit-tokens"); limitTokens > 0 {
+			snapshot.LimitTokens = limitTokens
+			hasData = true
+		}
+		if remainingTokens := headerInt64Value(headers, "x-ratelimit-remaining-tokens"); remainingTokens >= 0 && headerHas(headers, "x-ratelimit-remaining-tokens") {
+			v := remainingTokens
+			snapshot.RemainingTokens = &v
+			if snapshot.LimitTokens > 0 {
+				used := snapshot.LimitTokens - remainingTokens
+				if used < 0 {
+					used = 0
+				}
+				snapshot.UsedTokens = used
+			}
+			hasData = true
+		}
+		if limitRequests := headerInt64Value(headers, "x-ratelimit-limit-requests"); limitRequests > 0 {
+			snapshot.LimitRequests = limitRequests
+			hasData = true
+		}
+		if remainingRequests := headerInt64Value(headers, "x-ratelimit-remaining-requests"); remainingRequests >= 0 && headerHas(headers, "x-ratelimit-remaining-requests") {
+			v := remainingRequests
+			snapshot.RemainingRequests = &v
+			hasData = true
+		}
+		if hasData {
+			snapshot.Source = "response_headers"
+		}
+	}
+	if err != nil {
+		body := err.Message
+		if body == "" {
+			body = err.Code
+		}
+		if isFreeUsageExhaustedErrorMessage(body) {
+			snapshot.Exhausted = true
+			hasData = true
+			if msg := freeUsageErrorMessage(body); msg != "" {
+				snapshot.Message = msg
+			}
+			if snapshot.Source == "" {
+				snapshot.Source = "error_body"
+			}
+		}
+		if used, limit, ok := parseFreeUsageTokens(body); ok {
+			snapshot.UsedTokens = used
+			snapshot.LimitTokens = limit
+			remaining := limit - used
+			if remaining < 0 {
+				remaining = 0
+			}
+			snapshot.RemainingTokens = &remaining
+			hasData = true
+			if snapshot.Source == "" {
+				snapshot.Source = "error_body"
+			}
+		}
+	}
+	if !hasData {
+		return nil
+	}
+	return snapshot
+}
+
+func parseFreeUsageTokens(message string) (used, limit int64, ok bool) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return 0, 0, false
+	}
+	// tokens (actual/limit): 1035914/1000000
+	lower := strings.ToLower(message)
+	idx := strings.Index(lower, "tokens")
+	if idx < 0 {
+		return 0, 0, false
+	}
+	segment := message[idx:]
+	// Find first digit after colon or space around actual/limit.
+	start := -1
+	for i := 0; i < len(segment); i++ {
+		if segment[i] >= '0' && segment[i] <= '9' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return 0, 0, false
+	}
+	end := start
+	for end < len(segment) && ((segment[end] >= '0' && segment[end] <= '9') || segment[end] == ',' || segment[end] == '/' || segment[end] == ' ') {
+		end++
+	}
+	chunk := strings.ReplaceAll(segment[start:end], " ", "")
+	parts := strings.Split(chunk, "/")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	usedVal, errUsed := strconv.ParseInt(strings.ReplaceAll(parts[0], ",", ""), 10, 64)
+	limitVal, errLimit := strconv.ParseInt(strings.ReplaceAll(parts[1], ",", ""), 10, 64)
+	if errUsed != nil || errLimit != nil || usedVal < 0 || limitVal <= 0 {
+		return 0, 0, false
+	}
+	return usedVal, limitVal, true
+}
+
+func headerHas(headers http.Header, key string) bool {
+	if headers == nil {
+		return false
+	}
+	return strings.TrimSpace(headers.Get(key)) != ""
+}
+
+func headerInt64Value(headers http.Header, key string) int64 {
+	if headers == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(headers.Get(key))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func headersFromError(err error) http.Header {
+	if err == nil {
+		return nil
+	}
+	type headerProvider interface {
+		Headers() http.Header
+	}
+	var hp headerProvider
+	if errors.As(err, &hp) && hp != nil {
+		return hp.Headers()
+	}
+	return nil
+}
+
 func nextCloudflareCooldown(backoffLevel int, disableCooling bool, now time.Time) (time.Time, int) {
 	var next time.Time
 	if !disableCooling {
@@ -4333,6 +4622,18 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if !disableCooling {
 			if retryAfter != nil {
 				next = now.Add(*retryAfter)
+			} else if isFreeUsageExhaustedResultError(resultErr) {
+				next = now.Add(freeUsageQuotaCooldown)
+				auth.Quota.Reason = "free_usage_exhausted"
+				if resultErr != nil {
+					if msg := freeUsageErrorMessage(resultErr.Message); msg != "" {
+						auth.StatusMessage = msg
+					} else {
+						auth.StatusMessage = "free usage exhausted"
+					}
+				} else {
+					auth.StatusMessage = "free usage exhausted"
+				}
 			} else {
 				next, auth.Quota.BackoffLevel = quotaCooldownAfterFailure(auth.Quota, now)
 			}

@@ -1738,27 +1738,34 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if !homeEnabled {
-		var watcherWrapper *WatcherWrapper
 		reloadCallback := func(newCfg *config.Config) { s.applyWatcherConfigUpdate(newCfg) }
 
 		watcherWrapper, errCreate := s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
 		if errCreate != nil {
-			return fmt.Errorf("cliproxy: failed to create watcher: %w", errCreate)
-		}
-		s.watcher = watcherWrapper
-		s.ensureAuthUpdateQueue(ctx)
-		if s.authUpdates != nil {
-			watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-		}
-		watcherWrapper.SetConfig(s.cfg)
-		s.registerPluginAuthParser()
+			log.WithError(errCreate).Warn("file watcher unavailable; continuing without hot reload")
+		} else {
+			s.watcher = watcherWrapper
+			s.ensureAuthUpdateQueue(ctx)
+			if s.authUpdates != nil {
+				watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+			}
+			watcherWrapper.SetConfig(s.cfg)
+			s.registerPluginAuthParser()
 
-		watcherCtx, watcherCancel := context.WithCancel(context.Background())
-		s.watcherCancel = watcherCancel
-		if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
-			return fmt.Errorf("cliproxy: failed to start watcher: %w", errStart)
+			watcherCtx, watcherCancel := context.WithCancel(context.Background())
+			s.watcherCancel = watcherCancel
+			if errStart := watcherWrapper.Start(watcherCtx); errStart != nil {
+				log.WithError(errStart).Warn("file watcher failed to start; continuing without hot reload")
+				watcherCancel()
+				s.watcherCancel = nil
+				s.watcher = nil
+				if errStop := watcherWrapper.Stop(); errStop != nil {
+					log.WithError(errStop).Warn("failed to stop file watcher after start failure")
+				}
+			} else {
+				log.Info("file watcher started for config and auth directory changes")
+			}
 		}
-		log.Info("file watcher started for config and auth directory changes")
 		s.syncPluginModelRuntime(ctx)
 	}
 

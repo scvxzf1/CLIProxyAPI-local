@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const (
@@ -243,11 +243,7 @@ func repairResponsesWebsocketToolCallsWithCaches(outputCache, callCache *websock
 		return payload
 	}
 
-	updated, errSet := sjson.SetRawBytes(payload, "input", []byte(updatedRaw))
-	if errSet != nil {
-		return payload
-	}
-	return updated
+	return util.SetJSONRawBytes(payload, "input", []byte(updatedRaw))
 }
 
 func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCache, sessionKey string, rawArray string, allowOrphanOutputs bool) (string, error) {
@@ -359,11 +355,12 @@ func repairResponsesToolCallsArray(outputCache, callCache *websocketToolOutputCa
 		// Drop orphaned function_call items; upstream rejects transcripts with missing outputs.
 	}
 
-	out, errMarshal := json.Marshal(filtered)
-	if errMarshal != nil {
-		return "", errMarshal
+	// Join raw items instead of json.Marshal so large image data URLs are not re-encoded.
+	itemsBytes := make([][]byte, 0, len(filtered))
+	for _, item := range filtered {
+		itemsBytes = append(itemsBytes, item)
 	}
-	return string(out), nil
+	return string(util.JoinJSONRawMessages(itemsBytes)), nil
 }
 
 func recordResponsesWebsocketToolCallsFromPayload(sessionKey string, payload []byte) {

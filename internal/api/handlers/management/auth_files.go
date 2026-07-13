@@ -498,7 +498,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["account_type"] = accountType
 		}
 		if account != "" {
-			entry["account"] = account
+			// Mask API keys in management list responses so menu/UI never sees full secrets.
+			if strings.EqualFold(strings.TrimSpace(accountType), "api_key") {
+				entry["account"] = util.HideAPIKey(account)
+			} else {
+				entry["account"] = account
+			}
 		}
 	}
 	if !auth.CreatedAt.IsZero() {
@@ -566,6 +571,12 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
+	}
+	if auth.FreeUsage != nil {
+		entry["free_usage"] = auth.FreeUsage
+	}
+	if auth.Quota.Exceeded || auth.Quota.Reason != "" || !auth.Quota.NextRecoverAt.IsZero() || auth.Quota.BackoffLevel != 0 {
+		entry["quota"] = auth.Quota
 	}
 	return entry
 }

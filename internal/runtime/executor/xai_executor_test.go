@@ -63,7 +63,7 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 
 	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-4.3",
-		Payload: []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}]}`),
+		Payload: []byte(`{"model":"grok-4.3","metadata":{"user_id":"{\"session_id\":\"conv-xai-1\"}"},"input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:       false,
@@ -92,6 +92,9 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	}
 	if gjson.GetBytes(gotBody, "prompt_cache_key").String() != "conv-xai-1" {
 		t.Fatalf("prompt_cache_key missing from body: %s", string(gotBody))
+	}
+	if gjson.GetBytes(gotBody, "metadata").Exists() {
+		t.Fatalf("metadata exists, want removed for xAI upstream; body=%s", string(gotBody))
 	}
 	if !gjson.GetBytes(gotBody, "stream").Bool() {
 		t.Fatalf("stream = false, want true; body=%s", string(gotBody))
@@ -165,6 +168,174 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	}
 }
 
+func TestXAIExecutorGrokCLISessionUsesProxyHeaders(t *testing.T) {
+	var gotPath string
+	var gotAuth string
+	var gotTokenAuth string
+	var gotClientVersion string
+	var gotUserAgent string
+	var gotModelOverride string
+	var gotClientIdentifier string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		gotTokenAuth = r.Header.Get("X-XAI-Token-Auth")
+		gotClientVersion = r.Header.Get("x-grok-client-version")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotModelOverride = r.Header.Get("x-grok-model-override")
+		gotClientIdentifier = r.Header.Get("x-grok-client-identifier")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5-build-free\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "xai-grok-cli-session",
+		Provider: "xai",
+		Metadata: map[string]any{
+			"auth_kind":              "grok_cli_session",
+			"access_token":           "session-token",
+			"base_url":               server.URL,
+			"grok_cli_version":       "0.2.93",
+			"grok_client_identifier": "agent-test",
+		},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5(high)",
+		Payload: []byte(`{"model":"grok-4.5(high)","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotPath != "/responses" {
+		t.Fatalf("path = %q, want /responses", gotPath)
+	}
+	if gotAuth != "Bearer session-token" {
+		t.Fatalf("Authorization = %q, want Bearer session-token", gotAuth)
+	}
+	if gotTokenAuth != "xai-grok-cli" {
+		t.Fatalf("X-XAI-Token-Auth = %q, want xai-grok-cli", gotTokenAuth)
+	}
+	if gotClientVersion != "0.2.93" {
+		t.Fatalf("x-grok-client-version = %q, want 0.2.93", gotClientVersion)
+	}
+	if gotUserAgent != "xai-grok-workspace/0.2.93" {
+		t.Fatalf("User-Agent = %q, want xai-grok-workspace/0.2.93", gotUserAgent)
+	}
+	if gotModelOverride != "grok-4.5" {
+		t.Fatalf("x-grok-model-override = %q, want grok-4.5", gotModelOverride)
+	}
+	if gotClientIdentifier != "agent-test" {
+		t.Fatalf("x-grok-client-identifier = %q, want agent-test", gotClientIdentifier)
+	}
+}
+
+func TestXAIRequestCredsSelectsProxyByAuthKind(t *testing.T) {
+	_, baseURL := xaiRequestCreds(&cliproxyauth.Auth{
+		Provider: "xai",
+		Metadata: map[string]any{"auth_kind": "grok-cli-session"},
+	})
+	if baseURL != xaiGrokCLIProxyBaseURL {
+		t.Fatalf("baseURL = %q, want %q", baseURL, xaiGrokCLIProxyBaseURL)
+	}
+
+	_, baseURL = xaiRequestCreds(&cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"base_url":  "https://api.x.ai/v1",
+		},
+	})
+	if baseURL != xaiGrokCLIProxyBaseURL {
+		t.Fatalf("oauth baseURL = %q, want %q", baseURL, xaiGrokCLIProxyBaseURL)
+	}
+
+	_, baseURL = xaiRequestCreds(&cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "apikey",
+			"api_key":   "xai-api-key",
+			"base_url":  "https://api.x.ai/v1",
+		},
+	})
+	if baseURL != "https://api.x.ai/v1" {
+		t.Fatalf("api key baseURL = %q, want https://api.x.ai/v1", baseURL)
+	}
+}
+
+func TestXAIExecutorOAuthUsesGrokCLIProxyHeaders(t *testing.T) {
+	var gotTokenAuth string
+	var gotClientVersion string
+	var gotUserAgent string
+	var gotModelOverride string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTokenAuth = r.Header.Get("X-XAI-Token-Auth")
+		gotClientVersion = r.Header.Get("x-grok-client-version")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotModelOverride = r.Header.Get("x-grok-model-override")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.5-build-free\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+			"base_url":  server.URL,
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5(high)",
+		Payload: []byte(`{"model":"grok-4.5(high)","input":"hello"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if gotTokenAuth != "xai-grok-cli" {
+		t.Fatalf("X-XAI-Token-Auth = %q, want xai-grok-cli", gotTokenAuth)
+	}
+	if gotClientVersion != xaiDefaultGrokCLIVersion {
+		t.Fatalf("x-grok-client-version = %q, want %q", gotClientVersion, xaiDefaultGrokCLIVersion)
+	}
+	if gotUserAgent != xaiGrokCLIUserAgentPrefix+xaiDefaultGrokCLIVersion {
+		t.Fatalf("User-Agent = %q, want %q", gotUserAgent, xaiGrokCLIUserAgentPrefix+xaiDefaultGrokCLIVersion)
+	}
+	if gotModelOverride != "grok-4.5" {
+		t.Fatalf("x-grok-model-override = %q, want grok-4.5", gotModelOverride)
+	}
+}
+
+func TestXAIExecutorRefreshRejectsGrokCLISession(t *testing.T) {
+	exec := NewXAIExecutor(&config.Config{})
+	_, err := exec.Refresh(context.Background(), &cliproxyauth.Auth{
+		Provider: "xai",
+		Metadata: map[string]any{
+			"auth_kind":     "grok_cli_session",
+			"refresh_token": "should-not-be-used",
+		},
+	})
+	if err == nil {
+		t.Fatal("Refresh() error = nil, want grok cli session refresh error")
+	}
+	if !strings.Contains(err.Error(), "grok cli session expired") {
+		t.Fatalf("Refresh() error = %q, want grok cli session expired", err.Error())
+	}
+}
+
 func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
@@ -217,7 +388,7 @@ func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 			if errRequest != nil {
 				t.Fatalf("NewRequest() error = %v", errRequest)
 			}
-			applyXAIHeaders(httpReq, auth, "xai-token", true, gotSession)
+			applyXAIHeaders(httpReq, auth, "xai-token", true, gotSession, tt.model)
 			gotGrokConvID := httpReq.Header.Get("x-grok-conv-id")
 
 			if tt.wantGenerated {
@@ -1146,7 +1317,7 @@ func TestXAIExecutorComposerReusesClaudeCodeSession(t *testing.T) {
 	if errRequest != nil {
 		t.Fatalf("NewRequest() error = %v", errRequest)
 	}
-	applyXAIHeaders(httpReq, auth, "xai-token", true, first.sessionID)
+	applyXAIHeaders(httpReq, auth, "xai-token", true, first.sessionID, "grok-composer-2.5-fast")
 	if got := httpReq.Header.Get("x-grok-conv-id"); got != firstKey {
 		t.Fatalf("x-grok-conv-id = %q, want %q", got, firstKey)
 	}
@@ -1465,4 +1636,89 @@ func testValidGrokEncryptedContent() string {
 		buf = append(buf, sum[:]...)
 	}
 	return base64.RawStdEncoding.EncodeToString(buf[:256])
+}
+
+func TestNewXAIStatusErr_FreeUsageExhausted(t *testing.T) {
+	body := []byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1035914/1000000."}`)
+	err := newXAIStatusErr(http.StatusTooManyRequests, body)
+	if err.StatusCode() != http.StatusTooManyRequests {
+		t.Fatalf("StatusCode() = %d, want %d", err.StatusCode(), http.StatusTooManyRequests)
+	}
+	retryAfter := err.RetryAfter()
+	if retryAfter == nil {
+		t.Fatal("expected RetryAfter for free-usage-exhausted")
+	}
+	if *retryAfter != xaiFreeUsageCooldown {
+		t.Fatalf("RetryAfter = %v, want %v", *retryAfter, xaiFreeUsageCooldown)
+	}
+}
+
+func TestNewXAIStatusErr_Generic429HasNoLongCooldown(t *testing.T) {
+	body := []byte(`{"error":{"type":"rate_limit_error","message":"Rate limit reached."}}`)
+	err := newXAIStatusErr(http.StatusTooManyRequests, body)
+	if err.RetryAfter() != nil {
+		t.Fatalf("expected nil RetryAfter for generic 429, got %v", *err.RetryAfter())
+	}
+}
+
+func TestIsXAIFreeUsageExhaustedError(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "code field",
+			body: `{"code":"subscription:free-usage-exhausted","error":"used all free usage"}`,
+			want: true,
+		},
+		{
+			name: "nested error code",
+			body: `{"error":{"code":"subscription:free-usage-exhausted","message":"exhausted"}}`,
+			want: true,
+		},
+		{
+			name: "message only",
+			body: `{"error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window."}`,
+			want: true,
+		},
+		{
+			name: "ordinary rate limit",
+			body: `{"error":{"type":"rate_limit_error","message":"Rate limit reached."}}`,
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isXAIFreeUsageExhaustedError([]byte(tc.body)); got != tc.want {
+				t.Fatalf("isXAIFreeUsageExhaustedError() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseXAIFreeUsageTokens(t *testing.T) {
+	body := []byte(`{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1035914/1000000."}`)
+	used, limit, ok := parseXAIFreeUsageTokens(body)
+	if !ok {
+		t.Fatal("expected free usage tokens to parse")
+	}
+	if used != 1035914 || limit != 1000000 {
+		t.Fatalf("used/limit = %d/%d, want 1035914/1000000", used, limit)
+	}
+}
+
+func TestXAIFreeUsageFromHeaders(t *testing.T) {
+	headers := http.Header{}
+	headers.Set("x-ratelimit-limit-tokens", "2000000")
+	headers.Set("x-ratelimit-remaining-tokens", "1500000")
+	headers.Set("x-ratelimit-limit-requests", "21")
+	headers.Set("x-ratelimit-remaining-requests", "20")
+	limitTokens, remainingTokens, limitRequests, remainingRequests, ok := xaiFreeUsageFromHeaders(headers)
+	if !ok {
+		t.Fatal("expected free usage headers")
+	}
+	if limitTokens != 2000000 || remainingTokens != 1500000 || limitRequests != 21 || remainingRequests != 20 {
+		t.Fatalf("unexpected values: %d %d %d %d", limitTokens, remainingTokens, limitRequests, remainingRequests)
+	}
 }

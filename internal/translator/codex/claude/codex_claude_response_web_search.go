@@ -81,6 +81,7 @@ func appendCodexWebSearchToolResult(output []byte, params *ConvertCodexResponseT
 	stop, _ = sjson.SetBytes(stop, "index", params.BlockIndex)
 	output = translatorcommon.AppendSSEEventBytes(output, "content_block_stop", stop, 2)
 	params.WebSearchToolResultIDs[toolUseID] = struct{}{}
+	params.WebSearchRequests++
 	params.BlockIndex++
 	if toolUseID == params.LastWebSearchToolUseID {
 		params.LastWebSearchToolUseID = ""
@@ -126,19 +127,24 @@ func codexWebSearchQuery(root, item gjson.Result) string {
 }
 
 func codexWebSearchResultContent(root, item gjson.Result) []byte {
-	results := item.Get("results")
-	if !results.IsArray() {
-		results = root.Get("results")
-	}
+	results := firstCodexWebSearchResults(item, root)
 	if !results.IsArray() {
 		return nil
 	}
 	content := []byte(`[]`)
+	seen := make(map[string]struct{})
 	results.ForEach(func(_, result gjson.Result) bool {
 		url := strings.TrimSpace(result.Get("url").String())
 		if url == "" {
+			url = strings.TrimSpace(result.Get("link").String())
+		}
+		if url == "" {
 			return true
 		}
+		if _, ok := seen[url]; ok {
+			return true
+		}
+		seen[url] = struct{}{}
 		block := []byte(`{"type":"web_search_result","title":"","url":"","page_age":null}`)
 		block, _ = sjson.SetBytes(block, "url", url)
 		title := strings.TrimSpace(result.Get("title").String())
@@ -146,10 +152,28 @@ func codexWebSearchResultContent(root, item gjson.Result) []byte {
 			title = url
 		}
 		block, _ = sjson.SetBytes(block, "title", title)
+		if pageAge := strings.TrimSpace(result.Get("page_age").String()); pageAge != "" {
+			block, _ = sjson.SetBytes(block, "page_age", pageAge)
+		}
 		content, _ = sjson.SetRawBytes(content, "-1", block)
 		return true
 	})
+	if len(seen) == 0 {
+		return nil
+	}
 	return content
+}
+
+func firstCodexWebSearchResults(item, root gjson.Result) gjson.Result {
+	for _, source := range []gjson.Result{item, root} {
+		for _, path := range []string{"results", "action.sources", "sources", "action.results"} {
+			results := source.Get(path)
+			if results.IsArray() && results.Get("#").Int() > 0 {
+				return results
+			}
+		}
+	}
+	return gjson.Result{}
 }
 
 func appendCodexWebSearchNonStreamContent(out []byte, item gjson.Result, seen map[string]struct{}) []byte {
@@ -186,4 +210,36 @@ func appendCodexWebSearchNonStreamContent(out []byte, item gjson.Result, seen ma
 	out, _ = sjson.SetRawBytes(out, "content.-1", resultBlock)
 	seen[id] = struct{}{}
 	return out
+}
+
+func countCodexWebSearchRequests(responseData gjson.Result) int {
+	output := responseData.Get("output")
+	if !output.IsArray() {
+		return 0
+	}
+	count := 0
+	seen := make(map[string]struct{})
+	output.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() != "web_search_call" {
+			return true
+		}
+		id := strings.TrimSpace(item.Get("id").String())
+		if id == "" {
+			id = strings.TrimSpace(item.Get("call_id").String())
+		}
+		if id == "" {
+			return true
+		}
+		if _, ok := seen[id]; ok {
+			return true
+		}
+		emptyRoot := gjson.Result{}
+		if codexWebSearchQuery(emptyRoot, item) == "" && len(codexWebSearchResultContent(emptyRoot, item)) == 0 {
+			return true
+		}
+		seen[id] = struct{}{}
+		count++
+		return true
+	})
+	return count
 }

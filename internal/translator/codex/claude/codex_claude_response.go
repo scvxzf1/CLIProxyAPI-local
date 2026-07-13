@@ -38,6 +38,7 @@ type ConvertCodexResponseToClaudeParams struct {
 	WebSearchToolUseIDs        map[string]struct{}
 	WebSearchToolResultIDs     map[string]struct{}
 	LastWebSearchToolUseID     string
+	WebSearchRequests          int
 	PendingFunctionCalls       map[string]*pendingCodexFunctionCall
 	LastPendingFunctionCallKey string
 }
@@ -146,6 +147,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		template, _ = sjson.SetBytes(template, "usage.output_tokens", outputTokens)
 		if cachedTokens > 0 {
 			template, _ = sjson.SetBytes(template, "usage.cache_read_input_tokens", cachedTokens)
+		}
+		webSearchRequests := params.WebSearchRequests
+		if webSearchRequests == 0 {
+			webSearchRequests = countCodexWebSearchRequests(responseData)
+		}
+		if webSearchRequests > 0 {
+			template, _ = sjson.SetBytes(template, "usage.server_tool_use.web_search_requests", webSearchRequests)
 		}
 
 		output = translatorcommon.AppendSSEEventBytes(output, "message_delta", template, 2)
@@ -357,6 +365,9 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	out, _ = sjson.SetBytes(out, "usage.output_tokens", outputTokens)
 	if cachedTokens > 0 {
 		out, _ = sjson.SetBytes(out, "usage.cache_read_input_tokens", cachedTokens)
+	}
+	if webSearchRequests := countCodexWebSearchRequests(responseData); webSearchRequests > 0 {
+		out, _ = sjson.SetBytes(out, "usage.server_tool_use.web_search_requests", webSearchRequests)
 	}
 
 	hasToolCall := false

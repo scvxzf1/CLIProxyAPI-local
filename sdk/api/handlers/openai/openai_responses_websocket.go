@@ -39,9 +39,15 @@ const (
 	wsTimelineBodyKey    = "WEBSOCKET_TIMELINE_OVERRIDE"
 )
 
+const (
+	// Image-bearing Codex turns can include multi-megabyte data URLs.
+	// Match the relay/session limit so large screenshots do not stall reads.
+	responsesWebsocketMaxMessageLen = 64 << 20 // 64 MiB
+)
+
 var responsesWebsocketUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
+	ReadBufferSize:  1024 * 1024,
+	WriteBufferSize: 1024 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -215,6 +221,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	if err != nil {
 		return
 	}
+	// Default gorilla read limit is far too small for image data URLs.
+	conn.SetReadLimit(responsesWebsocketMaxMessageLen)
 	passthroughSessionID := uuid.NewString()
 	downstreamSessionKey := websocketDownstreamSessionKey(c.Request)
 	retainResponsesWebsocketToolCaches(downstreamSessionKey)
@@ -534,7 +542,7 @@ func normalizeResponseCreateRequest(rawJSON []byte) ([]byte, []byte, *interfaces
 	if errDelete != nil {
 		normalized = bytes.Clone(rawJSON)
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	normalized = util.SetJSONBytes(normalized, "stream", true)
 	if !gjson.GetBytes(normalized, "input").Exists() {
 		normalized, _ = sjson.SetRawBytes(normalized, "input", []byte("[]"))
 	}
@@ -590,11 +598,11 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 			if errDelete != nil {
 				normalized = bytes.Clone(rawJSON)
 			}
-			normalized, _ = sjson.SetBytes(normalized, "previous_response_id", prev)
+			normalized = util.SetJSONBytes(normalized, "previous_response_id", prev)
 			if !gjson.GetBytes(normalized, "model").Exists() {
 				modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 				if modelName != "" {
-					normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+					normalized = util.SetJSONBytes(normalized, "model", modelName)
 				}
 			}
 			if !gjson.GetBytes(normalized, "instructions").Exists() {
@@ -603,7 +611,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 					normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
 				}
 			}
-			normalized, _ = sjson.SetBytes(normalized, "stream", true)
+			normalized = util.SetJSONBytes(normalized, "stream", true)
 			return normalized, bytes.Clone(normalized), nil
 		}
 	}
@@ -655,18 +663,17 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 		normalized = bytes.Clone(rawJSON)
 	}
 	normalized, _ = sjson.DeleteBytes(normalized, "previous_response_id")
-	var errSet error
-	normalized, errSet = sjson.SetRawBytes(normalized, "input", []byte(mergedInput))
-	if errSet != nil {
+	normalized = util.SetJSONRawBytes(normalized, "input", []byte(mergedInput))
+	if !gjson.GetBytes(normalized, "input").Exists() {
 		return nil, lastRequest, &interfaces.ErrorMessage{
 			StatusCode: http.StatusBadRequest,
-			Error:      fmt.Errorf("failed to merge websocket input: %w", errSet),
+			Error:      fmt.Errorf("failed to merge websocket input"),
 		}
 	}
 	if !gjson.GetBytes(normalized, "model").Exists() {
 		modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 		if modelName != "" {
-			normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+			normalized = util.SetJSONBytes(normalized, "model", modelName)
 		}
 	}
 	if !gjson.GetBytes(normalized, "instructions").Exists() {
@@ -675,7 +682,7 @@ func normalizeResponseSubsequentRequest(rawJSON []byte, lastRequest []byte, last
 			normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
 		}
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	normalized = util.SetJSONBytes(normalized, "stream", true)
 	return normalized, bytes.Clone(normalized), nil
 }
 
@@ -744,7 +751,7 @@ func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) 
 	if !gjson.GetBytes(normalized, "model").Exists() {
 		modelName := strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
 		if modelName != "" {
-			normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+			normalized = util.SetJSONBytes(normalized, "model", modelName)
 		}
 	}
 	if !gjson.GetBytes(normalized, "instructions").Exists() {
@@ -753,7 +760,7 @@ func normalizeResponseTranscriptReplacement(rawJSON []byte, lastRequest []byte) 
 			normalized, _ = sjson.SetRawBytes(normalized, "instructions", []byte(instructions.Raw))
 		}
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	normalized = util.SetJSONBytes(normalized, "stream", true)
 	return bytes.Clone(normalized)
 }
 
@@ -1046,9 +1053,9 @@ func normalizeResponsesWebsocketPassthroughRequest(rawJSON []byte, modelName str
 				Error:      fmt.Errorf("missing model in response.create request"),
 			}
 		}
-		normalized, _ = sjson.SetBytes(normalized, "model", modelName)
+		normalized = util.SetJSONBytes(normalized, "model", modelName)
 	}
-	normalized, _ = sjson.SetBytes(normalized, "stream", true)
+	normalized = util.SetJSONBytes(normalized, "stream", true)
 	return normalized, nil
 }
 
@@ -1224,30 +1231,9 @@ func syntheticResponsesWebsocketPrewarmPayloads(requestJSON []byte) ([][]byte, e
 }
 
 func mergeJSONArrayRaw(existingRaw, appendRaw string) (string, error) {
-	existingRaw = strings.TrimSpace(existingRaw)
-	appendRaw = strings.TrimSpace(appendRaw)
-	if existingRaw == "" {
-		existingRaw = "[]"
-	}
-	if appendRaw == "" {
-		appendRaw = "[]"
-	}
-
-	var existing []json.RawMessage
-	if err := json.Unmarshal([]byte(existingRaw), &existing); err != nil {
-		return "", err
-	}
-	var appendItems []json.RawMessage
-	if err := json.Unmarshal([]byte(appendRaw), &appendItems); err != nil {
-		return "", err
-	}
-
-	merged := append(existing, appendItems...)
-	out, err := json.Marshal(merged)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	// Avoid json.Marshal on large image-bearing arrays; re-encoding multi-megabyte
+	// base64 blobs on every websocket turn is a common source of session stalls.
+	return util.MergeJSONArrayRaw(existingRaw, appendRaw)
 }
 
 // inputContainsFullTranscript returns true when the input array carries compact
@@ -1712,7 +1698,14 @@ func writeResponsesWebsocketPayload(conn *websocket.Conn, wsTimelineLog websocke
 	if wsTimelineLog != nil {
 		wsTimelineLog.Append("response", payload, timestamp)
 	}
-	return conn.WriteMessage(websocket.TextMessage, payload)
+	if conn == nil {
+		return fmt.Errorf("responses websocket: connection is nil")
+	}
+	// Large image payloads need a longer write window than gorilla's short default.
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	errWrite := conn.WriteMessage(websocket.TextMessage, payload)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return errWrite
 }
 
 func appendWebsocketTimelineDisconnect(timeline websocketTimelineAppender, err error, timestamp time.Time) {

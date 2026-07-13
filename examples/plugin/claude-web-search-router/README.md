@@ -22,7 +22,7 @@ Routing for `fallback` requires at least one runnable backend (providers in `Ava
 
 - **Model**: xAI documents `grok-4.3` for server-side `web_search`. This example sets `TargetModel` to **`grok-4.3`** when `xai_model` is empty (do not forward `claude-sonnet-4-6` to xAI).
 - **Request shape**: Responses API `input` + `tools[]` with `"type": "web_search"`. Optional `filters.allowed_domains` / `filters.excluded_domains` (max 5 each, mutually exclusive).
-- **Claude mapping today**: `internal/translator/codex/claude` copies Claude `allowed_domains` → `filters.allowed_domains`. Claude `blocked_domains` is **not** mapped to `excluded_domains` yet.
+- **Claude mapping today**: `internal/translator/codex/claude` maps Claude `allowed_domains` → `filters.allowed_domains`, and Claude `blocked_domains` → `filters.excluded_domains` (mutually exclusive; max 5). When both are present, `allowed_domains` wins.
 - **Executor**: `xai_executor` normalizes tools (drops unsupported `external_web_access` if present) and posts to `/responses`.
 - **Response**: Citations / server tool metadata come back through OpenAI Responses SSE and are converted toward Claude `server_tool_use` / `web_search_tool_result` where the response translator supports it.
 

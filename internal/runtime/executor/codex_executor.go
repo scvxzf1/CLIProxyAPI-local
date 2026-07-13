@@ -773,12 +773,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
+	body = util.SetJSONBytes(body, "model", baseModel)
+	body = util.SetJSONBytes(body, "stream", true)
+	body = util.DeleteJSONBytes(body, "previous_response_id")
+	body = util.DeleteJSONBytes(body, "prompt_cache_retention")
+	body = util.DeleteJSONBytes(body, "safety_identifier")
+	body = util.DeleteJSONBytes(body, "stream_options")
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -953,8 +953,8 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "stream")
+	body = util.SetJSONBytes(body, "model", baseModel)
+	body = util.DeleteJSONBytes(body, "stream")
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -1060,11 +1060,11 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = util.DeleteJSONBytes(body, "previous_response_id")
+	body = util.DeleteJSONBytes(body, "prompt_cache_retention")
+	body = util.DeleteJSONBytes(body, "safety_identifier")
+	body = util.DeleteJSONBytes(body, "stream_options")
+	body = util.SetJSONBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -1216,12 +1216,12 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 		return cliproxyexecutor.Response{}, err
 	}
 
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
-	body, _ = sjson.DeleteBytes(body, "stream_options")
-	body, _ = sjson.SetBytes(body, "stream", false)
+	body = util.SetJSONBytes(body, "model", baseModel)
+	body = util.DeleteJSONBytes(body, "previous_response_id")
+	body = util.DeleteJSONBytes(body, "prompt_cache_retention")
+	body = util.DeleteJSONBytes(body, "safety_identifier")
+	body = util.DeleteJSONBytes(body, "stream_options")
+	body = util.SetJSONBytes(body, "stream", false)
 	body = normalizeCodexInstructions(body)
 
 	enc, err := tokenizerForCodexModel(baseModel)
@@ -1707,7 +1707,7 @@ func codexStatusErrorClassification(statusCode int, body []byte) (code string, e
 func normalizeCodexInstructions(body []byte) []byte {
 	instructions := gjson.GetBytes(body, "instructions")
 	if !instructions.Exists() || instructions.Type == gjson.Null {
-		body, _ = sjson.SetBytes(body, "instructions", "")
+		body = util.SetJSONBytes(body, "instructions", "")
 	}
 	return body
 }
@@ -1758,7 +1758,7 @@ func normalizeCodexParallelToolCallsForTools(body []byte) []byte {
 		return body
 	}
 
-	body, _ = sjson.DeleteBytes(body, "parallel_tool_calls")
+	body = util.DeleteJSONBytes(body, "parallel_tool_calls")
 	return body
 }
 

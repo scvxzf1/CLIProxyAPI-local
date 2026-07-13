@@ -78,6 +78,9 @@ type Config struct {
 	// Default: 60. Max: 3600.
 	RedisUsageQueueRetentionSeconds int `yaml:"redis-usage-queue-retention-seconds" json:"redis-usage-queue-retention-seconds"`
 
+	// UsageKeeper embeds the optional CPA Usage Keeper sidecar and management UI entry.
+	UsageKeeper UsageKeeperConfig `yaml:"usage-keeper" json:"usage-keeper"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -298,6 +301,33 @@ type PprofConfig struct {
 	Enable bool `yaml:"enable" json:"enable"`
 	// Addr is the host:port address for the pprof HTTP server.
 	Addr string `yaml:"addr" json:"addr"`
+}
+
+// UsageKeeperConfig controls the optional embedded CPA Usage Keeper sidecar.
+// When enabled, CPA can reverse-proxy the Keeper dashboard under /usage-keeper/
+// and auto-wire CPA_BASE_URL / management key for the sidecar process.
+type UsageKeeperConfig struct {
+	// Enabled starts the embedded sidecar and exposes /usage-keeper routes.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Binary is an optional absolute/relative path to the cpa-usage-keeper executable.
+	// When empty, CPA looks under <config-dir>/usage-keeper/ and PATH.
+	Binary string `yaml:"binary" json:"binary"`
+	// WorkDir is the sidecar working directory for SQLite/logs/backups.
+	// Empty defaults to <config-dir>/usage-keeper-data.
+	WorkDir string `yaml:"work-dir" json:"work-dir"`
+	// ListenAddr is the local loopback address used by the sidecar HTTP server.
+	// Empty defaults to 127.0.0.1:18080.
+	ListenAddr string `yaml:"listen-addr" json:"listen-addr"`
+	// ManagementKey is the plaintext CPA management key used by the sidecar.
+	// Prefer env CPA_USAGE_KEEPER_MANAGEMENT_KEY / MANAGEMENT_PASSWORD when possible.
+	// Empty falls back to env, then leaves sidecar unconfigured.
+	ManagementKey string `yaml:"management-key" json:"management-key"`
+	// AuthEnabled enables Keeper dashboard password protection.
+	AuthEnabled bool `yaml:"auth-enabled" json:"auth-enabled"`
+	// LoginPassword is the Keeper dashboard password when AuthEnabled is true.
+	LoginPassword string `yaml:"login-password" json:"login-password"`
+	// ExtraEnv adds extra environment variables for the sidecar process.
+	ExtraEnv map[string]string `yaml:"extra-env" json:"extra-env"`
 }
 
 // RemoteManagement holds management API configuration under 'remote-management'.

@@ -856,8 +856,8 @@ func TestConvertCodexResponseToClaude_StreamWebSearchCallEmitsClaudeServerToolBl
 		[]byte(`data: {"type":"response.output_item.added","item":{"id":"ws_123","type":"web_search_call","status":"in_progress"}}`),
 		[]byte(`data: {"type":"response.web_search_call.searching","item_id":"ws_123"}`),
 		[]byte(`data: {"type":"response.web_search_call.completed","item_id":"ws_123"}`),
-		[]byte(`data: {"type":"response.output_item.done","item":{"id":"ws_123","type":"web_search_call","status":"completed","action":{"type":"search","query":"search weather"}}}`),
-		[]byte(`data: {"type":"response.completed","response":{"stop_reason":"stop","usage":{"input_tokens":3,"output_tokens":2}}}`),
+		[]byte(`data: {"type":"response.output_item.done","item":{"id":"ws_123","type":"web_search_call","status":"completed","action":{"type":"search","query":"search weather","sources":[{"url":"https://example.com/weather","title":"Weather"}]}}}`),
+		[]byte(`data: {"type":"response.completed","response":{"stop_reason":"stop","usage":{"input_tokens":3,"output_tokens":2},"output":[{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"search weather","sources":[{"url":"https://example.com/weather","title":"Weather"}]}}]}}`),
 	}
 	var outputs [][]byte
 	for _, chunk := range chunks {
@@ -869,6 +869,8 @@ func TestConvertCodexResponseToClaude_StreamWebSearchCallEmitsClaudeServerToolBl
 		`"type":"server_tool_use"`,
 		`"id":"ws_123"`,
 		`"type":"web_search_tool_result"`,
+		`"url":"https://example.com/weather"`,
+		`"web_search_requests":1`,
 		`event: message_stop`,
 	} {
 		if !strings.Contains(outputText, needle) {
@@ -1055,9 +1057,15 @@ func TestConvertCodexResponseToClaude_StreamStopSequenceMapping(t *testing.T) {
 func TestConvertCodexResponseToClaudeNonStream_WebSearchCallEmitsServerToolBlocks(t *testing.T) {
 	ctx := context.Background()
 	originalRequest := []byte(`{"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"search weather"}]}`)
-	response := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.3-codex-spark","stop_reason":"stop","usage":{"input_tokens":3,"output_tokens":2},"output":[{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"search weather"}},{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}`)
+	response := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.3-codex-spark","stop_reason":"stop","usage":{"input_tokens":3,"output_tokens":2},"output":[{"type":"web_search_call","id":"ws_123","status":"completed","action":{"type":"search","query":"search weather","sources":[{"url":"https://example.com/weather","title":"Weather"}]}},{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}`)
 	out := ConvertCodexResponseToClaudeNonStream(ctx, "", originalRequest, nil, response, nil)
 	parsed := gjson.ParseBytes(out)
+	if got := parsed.Get("usage.server_tool_use.web_search_requests").Int(); got != 1 {
+		t.Fatalf("web_search_requests = %d, want 1: %s", got, out)
+	}
+	if got := parsed.Get("content.1.content.0.url").String(); got != "https://example.com/weather" {
+		t.Fatalf("web_search result url = %q, want example weather url: %s", got, out)
+	}
 	types := []string{}
 	parsed.Get("content").ForEach(func(_, value gjson.Result) bool {
 		types = append(types, value.Get("type").String())

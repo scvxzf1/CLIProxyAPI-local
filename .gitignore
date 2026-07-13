@@ -56,3 +56,7 @@ _bmad-output/*
 .DS_Store
 ._*
 .gocache/
+
+# Embedded usage-keeper runtime artifacts
+usage-keeper/
+usage-keeper-data/

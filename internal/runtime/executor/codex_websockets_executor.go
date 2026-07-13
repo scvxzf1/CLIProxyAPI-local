@@ -38,6 +38,9 @@ const (
 	codexResponsesWebsocketBetaHeaderValue = "responses_websockets=2026-02-06"
 	codexResponsesWebsocketIdleTimeout     = 5 * time.Minute
 	codexResponsesWebsocketHandshakeTO     = 30 * time.Second
+	// Codex/xAI websocket turns can carry multi-megabyte image data URLs.
+	// Keep this aligned with internal/wsrelay so large image payloads are not dropped.
+	codexResponsesWebsocketMaxMessageLen = 64 << 20 // 64 MiB
 )
 
 // CodexWebsocketsExecutor executes Codex Responses requests using a WebSocket transport.
@@ -140,7 +143,11 @@ func (s *codexWebsocketSession) writeMessage(conn *websocket.Conn, msgType int, 
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return conn.WriteMessage(msgType, payload)
+	// Large image payloads can take longer than the default short write window.
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	errWrite := conn.WriteMessage(msgType, payload)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return errWrite
 }
 
 func (s *codexWebsocketSession) configureConn(conn *websocket.Conn) {
@@ -206,10 +213,10 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
-	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
-	body, _ = sjson.DeleteBytes(body, "safety_identifier")
+	body = util.SetJSONBytes(body, "model", baseModel)
+	body = util.SetJSONBytes(body, "stream", true)
+	body = util.DeleteJSONBytes(body, "prompt_cache_retention")
+	body = util.DeleteJSONBytes(body, "safety_identifier")
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -430,7 +437,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	body = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, to.String(), from.String(), "", body, body, requestedModel, requestPath, opts.Headers)
-	body, _ = sjson.SetBytes(body, "model", baseModel)
+	body = util.SetJSONBytes(body, "model", baseModel)
 	body = normalizeCodexInstructions(body)
 	if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
 		body = ensureImageGenerationTool(body, baseModel, auth)
@@ -713,6 +720,8 @@ func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *
 		// Avoid gorilla/websocket flate tail validation issues on some upstreams/Go versions.
 		// Negotiating permessage-deflate is fine; we just don't compress outbound messages.
 		conn.EnableWriteCompression(false)
+		// Image-bearing turns routinely exceed gorilla's tiny default read limit.
+		conn.SetReadLimit(codexResponsesWebsocketMaxMessageLen)
 	}
 	return conn, resp, err
 }
@@ -724,7 +733,10 @@ func writeCodexWebsocketMessage(sess *codexWebsocketSession, conn *websocket.Con
 	if conn == nil {
 		return fmt.Errorf("codex websockets executor: websocket conn is nil")
 	}
-	return conn.WriteMessage(websocket.TextMessage, payload)
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Minute))
+	errWrite := conn.WriteMessage(websocket.TextMessage, payload)
+	_ = conn.SetWriteDeadline(time.Time{})
+	return errWrite
 }
 
 func mapCodexWebsocketReadError(err error) error {
@@ -746,13 +758,9 @@ func buildCodexWebsocketRequestBody(body []byte) []byte {
 	// Match codex-rs websocket v2 semantics: every request is `response.create`.
 	// Incremental follow-up turns continue on the same websocket using
 	// `previous_response_id` + incremental `input`, not `response.append`.
-	wsReqBody, errSet := sjson.SetBytes(bytes.Clone(body), "type", "response.create")
-	if errSet == nil && len(wsReqBody) > 0 {
-		return wsReqBody
-	}
-	fallback := bytes.Clone(body)
-	fallback, _ = sjson.SetBytes(fallback, "type", "response.create")
-	return fallback
+	// Prefer in-place field update so multi-megabyte image payloads are not
+	// fully rewritten just to inject the event type.
+	return util.SetJSONBytes(body, "type", "response.create")
 }
 
 func readCodexWebsocketMessage(ctx context.Context, sess *codexWebsocketSession, conn *websocket.Conn, readCh chan codexWebsocketRead) (int, []byte, error) {

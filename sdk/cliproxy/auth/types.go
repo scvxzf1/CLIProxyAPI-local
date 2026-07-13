@@ -75,6 +75,8 @@ type Auth struct {
 	Metadata map[string]any `json:"metadata,omitempty"`
 	// Quota captures recent quota information for load balancers.
 	Quota QuotaState `json:"quota"`
+	// FreeUsage captures the latest free-tier usage snapshot for account display.
+	FreeUsage *FreeUsageState `json:"free_usage,omitempty"`
 	// LastError stores the last failure encountered while executing or refreshing.
 	LastError *Error `json:"last_error,omitempty"`
 	// CreatedAt is the creation timestamp in UTC.
@@ -162,6 +164,86 @@ type RecentRequestBucket struct {
 	Time    string `json:"time"`
 	Success int64  `json:"success"`
 	Failed  int64  `json:"failed"`
+}
+
+// ApplyFreeUsageFromMetadata hydrates FreeUsage from auth file metadata when present.
+// Free-tier snapshots are stored under metadata["free_usage"] so they survive restarts
+// even though the file-backed store only persists Metadata maps.
+func ApplyFreeUsageFromMetadata(auth *Auth) {
+	if auth == nil || auth.Metadata == nil {
+		return
+	}
+	raw, ok := auth.Metadata["free_usage"]
+	if !ok || raw == nil {
+		return
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return
+	}
+	var usage FreeUsageState
+	if err = json.Unmarshal(data, &usage); err != nil {
+		return
+	}
+	if usage.LimitTokens == 0 && usage.UsedTokens == 0 && usage.RemainingTokens == nil &&
+		usage.LimitRequests == 0 && usage.RemainingRequests == nil && !usage.Exhausted &&
+		strings.TrimSpace(usage.Model) == "" && strings.TrimSpace(usage.Window) == "" &&
+		strings.TrimSpace(usage.Message) == "" && usage.ObservedAt.IsZero() {
+		return
+	}
+	auth.FreeUsage = &usage
+}
+
+// SyncFreeUsageToMetadata copies the in-memory free-usage snapshot into Metadata
+// so file/object/postgres stores can persist it with the auth credential JSON.
+func SyncFreeUsageToMetadata(auth *Auth) {
+	if auth == nil || auth.FreeUsage == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		// Avoid creating metadata for runtime-only auths that cannot be persisted safely.
+		return
+	}
+	data, err := json.Marshal(auth.FreeUsage)
+	if err != nil {
+		return
+	}
+	var asMap map[string]any
+	if err = json.Unmarshal(data, &asMap); err != nil {
+		return
+	}
+	auth.Metadata["free_usage"] = asMap
+}
+
+// FreeUsageState captures the latest free-tier usage snapshot for display.
+// Grok free accounts expose rolling token windows via response headers / exhaustion errors,
+// not the subscription billing endpoints used by SuperGrok.
+type FreeUsageState struct {
+	// Model is the free-tier model this snapshot applies to when known.
+	Model string `json:"model,omitempty"`
+	// UsedTokens is the observed consumed token count in the free window.
+	// Only trustworthy when Source is error_body (actual/limit from free-usage-exhausted).
+	UsedTokens int64 `json:"used_tokens,omitempty"`
+	// LimitTokens is the free-window token limit when known.
+	LimitTokens int64 `json:"limit_tokens,omitempty"`
+	// RemainingTokens is the free-window remaining token budget when known.
+	// Response-header remaining values are not reliable for Grok free accounts.
+	RemainingTokens *int64 `json:"remaining_tokens,omitempty"`
+	// LimitRequests is the free-window request limit when known.
+	LimitRequests int64 `json:"limit_requests,omitempty"`
+	// RemainingRequests is the free-window remaining request budget when known.
+	// Response-header remaining values are not reliable for Grok free accounts.
+	RemainingRequests *int64 `json:"remaining_requests,omitempty"`
+	// Window describes the free quota window, e.g. "rolling_24h".
+	Window string `json:"window,omitempty"`
+	// Exhausted marks that the free window was observed as fully consumed.
+	Exhausted bool `json:"exhausted,omitempty"`
+	// Message stores the latest free-usage error text from upstream when available.
+	Message string `json:"message,omitempty"`
+	// Source identifies how the snapshot was obtained (response_headers|error_body).
+	Source string `json:"source,omitempty"`
+	// ObservedAt is when the snapshot was last refreshed.
+	ObservedAt time.Time `json:"observed_at,omitempty"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -281,6 +363,18 @@ func (a *Auth) Clone() *Auth {
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
+	}
+	if a.FreeUsage != nil {
+		copyUsage := *a.FreeUsage
+		if a.FreeUsage.RemainingTokens != nil {
+			v := *a.FreeUsage.RemainingTokens
+			copyUsage.RemainingTokens = &v
+		}
+		if a.FreeUsage.RemainingRequests != nil {
+			v := *a.FreeUsage.RemainingRequests
+			copyUsage.RemainingRequests = &v
+		}
+		copyAuth.FreeUsage = &copyUsage
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth

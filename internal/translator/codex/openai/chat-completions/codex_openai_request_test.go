@@ -842,3 +842,28 @@ func TestToolsDefinitionTranslated(t *testing.T) {
 		t.Errorf("tool 'search' not found in output tools: %s", gjson.Get(result, "tools").Raw)
 	}
 }
+
+func TestConvertOpenAIRequestToCodex_WebSearchPreviewNormalized(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4",
+		"messages": [{"role":"user","content":"search weather"}],
+		"tools": [
+			{"type":"web_search_preview","search_context_size":"high"},
+			{"type":"web_search_preview_2025_03_11"}
+		],
+		"tool_choice": {"type":"web_search_preview"}
+	}`)
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", input, true)
+	if got := gjson.GetBytes(out, "tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tools.0.type = %q, want web_search: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.search_context_size").String(); got != "high" {
+		t.Fatalf("tools.0.search_context_size = %q, want high: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.1.type").String(); got != "web_search" {
+		t.Fatalf("tools.1.type = %q, want web_search: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "web_search" {
+		t.Fatalf("tool_choice.type = %q, want web_search: %s", got, out)
+	}
+}

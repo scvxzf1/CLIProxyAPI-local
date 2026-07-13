@@ -3,8 +3,11 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 func withQuotaCooldownEnabled(t *testing.T) {
@@ -191,5 +194,180 @@ func TestJitteredCooldownWaitBounds(t *testing.T) {
 	}
 	if got := jitteredCooldownWait(3, 0); got != 3 {
 		t.Fatalf("expected sub-4ns wait to stay unchanged, got %v", got)
+	}
+}
+
+func TestMarkResult_FreeUsageExhaustedUsesLongCooldown(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-free", Provider: "xai", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	msg := `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window."}`
+	m.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "grok-4.5",
+		Success: false,
+		Error:   &Error{HTTPStatus: http.StatusTooManyRequests, Message: msg},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("auth not found after MarkResult")
+	}
+	state := updated.ModelStates["grok-4.5"]
+	if state == nil {
+		t.Fatal("model state missing")
+	}
+	if !state.Quota.Exceeded {
+		t.Fatal("expected quota exceeded")
+	}
+	if state.Quota.Reason != "free_usage_exhausted" {
+		t.Fatalf("Quota.Reason = %q, want free_usage_exhausted", state.Quota.Reason)
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 22*time.Hour || remaining > 24*time.Hour {
+		t.Fatalf("NextRetryAfter remaining = %v, want ~23h", remaining)
+	}
+
+	// Selector must skip the exhausted credential until the long window ends.
+	selector := &RoundRobinSelector{}
+	if _, err := selector.Pick(context.Background(), "xai", "grok-4.5", cliproxyexecutor.Options{}, []*Auth{updated}); err == nil {
+		t.Fatal("expected exhausted auth to be blocked by selector")
+	}
+}
+
+func TestMarkResult_FreeUsageExhaustedWithRetryAfter(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-free-retry", Provider: "xai", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	retryAfter := 23 * time.Hour
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Model:      "grok-4.5",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "subscription:free-usage-exhausted"},
+	})
+	updated, ok := m.GetByID(auth.ID)
+	if !ok {
+		t.Fatal("auth not found")
+	}
+	state := updated.ModelStates["grok-4.5"]
+	if state == nil {
+		t.Fatal("model state missing")
+	}
+	remaining := time.Until(state.NextRetryAfter)
+	if remaining < 22*time.Hour || remaining > 24*time.Hour {
+		t.Fatalf("NextRetryAfter remaining = %v, want ~23h", remaining)
+	}
+}
+
+func TestMarkResult_CapturesFreeUsageFromHeaders(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-free-headers", Provider: "xai", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	headers := http.Header{}
+	headers.Set("x-ratelimit-limit-tokens", "2000000")
+	headers.Set("x-ratelimit-remaining-tokens", "1500000")
+	headers.Set("x-ratelimit-limit-requests", "21")
+	headers.Set("x-ratelimit-remaining-requests", "20")
+	m.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "grok-4.5",
+		Success: true,
+		Headers: headers,
+	})
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil || updated.FreeUsage == nil {
+		t.Fatal("expected free usage snapshot")
+	}
+	if updated.FreeUsage.LimitTokens != 2000000 {
+		t.Fatalf("LimitTokens = %d, want 2000000", updated.FreeUsage.LimitTokens)
+	}
+	if updated.FreeUsage.UsedTokens != 500000 {
+		t.Fatalf("UsedTokens = %d, want 500000", updated.FreeUsage.UsedTokens)
+	}
+	if updated.FreeUsage.RemainingTokens == nil || *updated.FreeUsage.RemainingTokens != 1500000 {
+		t.Fatalf("RemainingTokens = %v, want 1500000", updated.FreeUsage.RemainingTokens)
+	}
+	if updated.FreeUsage.Window != "rolling_24h" {
+		t.Fatalf("Window = %q, want rolling_24h", updated.FreeUsage.Window)
+	}
+}
+
+func TestMarkResult_SyncsFreeUsageIntoMetadata(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-free-meta",
+		Provider: "xai",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "xai", "email": "free@example.com"},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	headers := http.Header{}
+	headers.Set("x-ratelimit-limit-tokens", "2000000")
+	headers.Set("x-ratelimit-remaining-tokens", "1500000")
+	m.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "grok-4.5",
+		Success: true,
+		Headers: headers,
+	})
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil || updated.FreeUsage == nil {
+		t.Fatal("expected free usage snapshot")
+	}
+	raw, ok := updated.Metadata["free_usage"]
+	if !ok || raw == nil {
+		t.Fatal("expected free_usage in metadata")
+	}
+	hydrated := &Auth{Metadata: updated.Metadata}
+	ApplyFreeUsageFromMetadata(hydrated)
+	if hydrated.FreeUsage == nil || hydrated.FreeUsage.LimitTokens != 2000000 {
+		t.Fatalf("hydrated free usage = %+v", hydrated.FreeUsage)
+	}
+}
+
+func TestMarkResult_CapturesFreeUsageFromErrorBody(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "auth-free-error", Provider: "xai", Status: StatusActive}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	msg := `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.5-build-free for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 1035914/1000000."}`
+	m.MarkResult(context.Background(), Result{
+		AuthID:  auth.ID,
+		Model:   "grok-4.5",
+		Success: false,
+		Error:   &Error{HTTPStatus: http.StatusTooManyRequests, Message: msg},
+	})
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil || updated.FreeUsage == nil {
+		t.Fatal("expected free usage snapshot from error")
+	}
+	if !updated.FreeUsage.Exhausted {
+		t.Fatal("expected exhausted=true")
+	}
+	if updated.FreeUsage.UsedTokens != 1035914 || updated.FreeUsage.LimitTokens != 1000000 {
+		t.Fatalf("used/limit = %d/%d", updated.FreeUsage.UsedTokens, updated.FreeUsage.LimitTokens)
+	}
+	if !strings.Contains(updated.FreeUsage.Message, "tokens (actual/limit): 1035914/1000000") {
+		t.Fatalf("Message = %q, want official free-usage text", updated.FreeUsage.Message)
+	}
+	if !strings.Contains(updated.StatusMessage, "tokens (actual/limit): 1035914/1000000") {
+		t.Fatalf("StatusMessage = %q, want official free-usage text", updated.StatusMessage)
 	}
 }

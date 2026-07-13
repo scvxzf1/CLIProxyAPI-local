@@ -8,6 +8,7 @@ package claude
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -181,6 +182,31 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 								appendImageContent(dataURL)
 							}
 						}
+					case "server_tool_use":
+						// Preserve prior Claude Code server web_search turns as Codex web_search_call items.
+						if strings.TrimSpace(messageContentResult.Get("name").String()) != "web_search" {
+							continue
+						}
+						flushMessage()
+						webSearchItem := []byte(`{"type":"web_search_call","status":"completed","action":{"type":"search"}}`)
+						id := strings.TrimSpace(messageContentResult.Get("id").String())
+						if id == "" {
+							id = fmt.Sprintf("web_search_%d", j)
+						}
+						webSearchItem, _ = sjson.SetBytes(webSearchItem, "id", id)
+						if query := strings.TrimSpace(messageContentResult.Get("input.query").String()); query != "" {
+							webSearchItem, _ = sjson.SetBytes(webSearchItem, "action.query", query)
+						}
+						template, _ = sjson.SetRawBytes(template, "input.-1", webSearchItem)
+					case "web_search_tool_result":
+						// Attach sources onto the matching prior web_search_call when possible.
+						flushMessage()
+						toolUseID := strings.TrimSpace(messageContentResult.Get("tool_use_id").String())
+						sources := extractClaudeWebSearchResultSources(messageContentResult.Get("content"))
+						if toolUseID == "" || len(sources) == 0 {
+							continue
+						}
+						template = attachSourcesToCodexWebSearchCall(template, toolUseID, sources)
 					case "tool_use":
 						flushMessage()
 						functionCallMessage := []byte(`{"type":"function_call"}`)
@@ -439,12 +465,48 @@ func convertClaudeToolChoiceToCodex(toolChoice gjson.Result, toolNameMap map[str
 
 func convertClaudeWebSearchToolToCodex(tool gjson.Result) []byte {
 	out := []byte(`{"type":"web_search"}`)
-	if allowedDomains := tool.Get("allowed_domains"); allowedDomains.Exists() && allowedDomains.IsArray() {
-		out, _ = sjson.SetRawBytes(out, "filters.allowed_domains", []byte(allowedDomains.Raw))
+	// OpenAI/xAI Responses web_search filters treat allowed/excluded domains as
+	// mutually exclusive and typically accept at most 5 entries each.
+	allowedDomains := normalizeClaudeWebSearchDomains(tool.Get("allowed_domains"))
+	blockedDomains := normalizeClaudeWebSearchDomains(tool.Get("blocked_domains"))
+	switch {
+	case len(allowedDomains) > 0:
+		if domainsJSON, err := json.Marshal(allowedDomains); err == nil {
+			out, _ = sjson.SetRawBytes(out, "filters.allowed_domains", domainsJSON)
+		}
+	case len(blockedDomains) > 0:
+		if domainsJSON, err := json.Marshal(blockedDomains); err == nil {
+			out, _ = sjson.SetRawBytes(out, "filters.excluded_domains", domainsJSON)
+		}
 	}
 	if userLocation := tool.Get("user_location"); userLocation.Exists() && userLocation.IsObject() {
 		out, _ = sjson.SetRawBytes(out, "user_location", []byte(userLocation.Raw))
 	}
+	return out
+}
+
+const codexWebSearchDomainLimit = 5
+
+// normalizeClaudeWebSearchDomains trims empty entries and caps domain filters so
+// Codex/xAI Responses accept the payload.
+func normalizeClaudeWebSearchDomains(domains gjson.Result) []string {
+	if !domains.Exists() || !domains.IsArray() {
+		return nil
+	}
+	out := make([]string, 0, int(domains.Get("#").Int()))
+	seen := make(map[string]struct{}, len(out))
+	domains.ForEach(func(_, domain gjson.Result) bool {
+		value := strings.TrimSpace(domain.String())
+		if value == "" {
+			return true
+		}
+		if _, ok := seen[value]; ok {
+			return true
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+		return len(out) < codexWebSearchDomainLimit
+	})
 	return out
 }
 
@@ -559,4 +621,59 @@ func normalizeToolParameters(raw string) string {
 		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
 	}
 	return string(schema)
+}
+
+func extractClaudeWebSearchResultSources(content gjson.Result) []byte {
+	if !content.IsArray() {
+		return nil
+	}
+	sources := []byte(`[]`)
+	seen := make(map[string]struct{})
+	content.ForEach(func(_, item gjson.Result) bool {
+		itemType := item.Get("type").String()
+		if itemType != "" && itemType != "web_search_result" {
+			return true
+		}
+		url := strings.TrimSpace(item.Get("url").String())
+		if url == "" {
+			return true
+		}
+		if _, ok := seen[url]; ok {
+			return true
+		}
+		seen[url] = struct{}{}
+		source := []byte(`{"url":"","title":""}`)
+		source, _ = sjson.SetBytes(source, "url", url)
+		title := strings.TrimSpace(item.Get("title").String())
+		if title == "" {
+			title = url
+		}
+		source, _ = sjson.SetBytes(source, "title", title)
+		sources, _ = sjson.SetRawBytes(sources, "-1", source)
+		return true
+	})
+	if len(seen) == 0 {
+		return nil
+	}
+	return sources
+}
+
+func attachSourcesToCodexWebSearchCall(template []byte, toolUseID string, sources []byte) []byte {
+	input := gjson.GetBytes(template, "input")
+	if !input.IsArray() {
+		return template
+	}
+	for i, item := range input.Array() {
+		if item.Get("type").String() != "web_search_call" {
+			continue
+		}
+		if strings.TrimSpace(item.Get("id").String()) != toolUseID {
+			continue
+		}
+		updated := []byte(item.Raw)
+		updated, _ = sjson.SetRawBytes(updated, "action.sources", sources)
+		template, _ = sjson.SetRawBytes(template, fmt.Sprintf("input.%d", i), updated)
+		break
+	}
+	return template
 }

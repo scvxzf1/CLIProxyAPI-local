@@ -13,7 +13,7 @@ services:
     environment:
       HOME_JWT: ${HOME_JWT:-}
     ports:
-      - "8317:8317"
+      - "8318:8318"
     volumes:
       - ./home:/root/.cli-proxy-api
       - ./logs:/CLIProxyAPI/logs

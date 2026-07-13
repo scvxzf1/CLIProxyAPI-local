@@ -2,6 +2,7 @@ package chat_completions
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -166,5 +167,38 @@ func TestConvertCodexResponseToOpenAI_NonStreamMultiMessageEmptyTrailingKeepsCon
 	}
 	if got.String() != "the real answer" {
 		t.Fatalf("expected content %q, got %q; resp=%s", "the real answer", got.String(), string(out))
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_StreamWebSearchCallEmitsAnnotations(t *testing.T) {
+	ctx := context.Background()
+	var param any
+	_ = ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4","created_at":1}}`), &param)
+	outs := ConvertCodexResponseToOpenAI(ctx, "gpt-5.4", nil, nil, []byte(`data: {"type":"response.output_item.done","item":{"id":"ws_1","type":"web_search_call","status":"completed","action":{"type":"search","query":"weather","sources":[{"url":"https://example.com/w","title":"Weather"}]}}}`), &param)
+	if len(outs) != 1 {
+		t.Fatalf("expected 1 chunk, got %d", len(outs))
+	}
+	root := gjson.ParseBytes(outs[0])
+	if got := root.Get("choices.0.delta.annotations.0.type").String(); got != "url_citation" {
+		t.Fatalf("annotation type = %q, want url_citation: %s", got, outs[0])
+	}
+	if got := root.Get("choices.0.delta.annotations.0.url").String(); got != "https://example.com/w" {
+		t.Fatalf("annotation url = %q: %s", got, outs[0])
+	}
+	if !strings.Contains(root.Get("choices.0.delta.content").String(), "https://example.com/w") {
+		t.Fatalf("expected summary content with source url: %s", outs[0])
+	}
+}
+
+func TestConvertCodexResponseToOpenAI_NonStreamWebSearchCallAddsMessageAnnotations(t *testing.T) {
+	ctx := context.Background()
+	response := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"output":[{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"weather","sources":[{"url":"https://example.com/w","title":"Weather"}]}},{"type":"message","content":[{"type":"output_text","text":"sunny"}]}]}}`)
+	out := ConvertCodexResponseToOpenAINonStream(ctx, "gpt-5.4", nil, nil, response, nil)
+	root := gjson.ParseBytes(out)
+	if got := root.Get("choices.0.message.annotations.0.url").String(); got != "https://example.com/w" {
+		t.Fatalf("annotation url = %q: %s", got, out)
+	}
+	if got := root.Get("choices.0.message.content").String(); got != "sunny" {
+		t.Fatalf("content = %q, want sunny: %s", got, out)
 	}
 }

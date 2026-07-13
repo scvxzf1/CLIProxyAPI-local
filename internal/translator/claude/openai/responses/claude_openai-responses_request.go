@@ -712,6 +712,8 @@ func convertResponsesWebSearchToolToClaude(tool gjson.Result) ([]byte, bool) {
 	}
 	if allowedDomains := tool.Get("filters.allowed_domains"); allowedDomains.Exists() && allowedDomains.IsArray() {
 		tJSON, _ = sjson.SetRawBytes(tJSON, "allowed_domains", []byte(allowedDomains.Raw))
+	} else if excludedDomains := tool.Get("filters.excluded_domains"); excludedDomains.Exists() && excludedDomains.IsArray() {
+		tJSON, _ = sjson.SetRawBytes(tJSON, "blocked_domains", []byte(excludedDomains.Raw))
 	}
 	if userLocation := tool.Get("user_location"); userLocation.Exists() && userLocation.IsObject() {
 		tJSON, _ = sjson.SetRawBytes(tJSON, "user_location", []byte(userLocation.Raw))

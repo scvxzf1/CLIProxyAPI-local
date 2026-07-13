@@ -385,6 +385,10 @@ func TestConvertClaudeRequestToCodex_WebSearchToolMapping(t *testing.T) {
 	if got := resultJSON.Get("tools.0.filters.allowed_domains.0").String(); got != "example.com" {
 		t.Fatalf("tools.0.filters.allowed_domains.0 = %q, want example.com. Output: %s", got, string(result))
 	}
+	// allowed_domains wins when both are present (Responses filters are mutually exclusive).
+	if resultJSON.Get("tools.0.filters.excluded_domains").Exists() {
+		t.Fatalf("tools.0.filters.excluded_domains should be omitted when allowed_domains is set. Output: %s", string(result))
+	}
 	if resultJSON.Get("tools.0.blocked_domains").Exists() {
 		t.Fatalf("tools.0.blocked_domains should not be forwarded to Codex. Output: %s", string(result))
 	}
@@ -393,6 +397,36 @@ func TestConvertClaudeRequestToCodex_WebSearchToolMapping(t *testing.T) {
 	}
 	if got := resultJSON.Get("tool_choice.type").String(); got != "web_search" {
 		t.Fatalf("tool_choice.type = %q, want web_search. Output: %s", got, string(result))
+	}
+}
+
+func TestConvertClaudeRequestToCodex_WebSearchBlockedDomainsMapToExcluded(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"tools": [
+			{
+				"type": "web_search_20250305",
+				"name": "web_search",
+				"blocked_domains": ["blocked.example", "evil.example", "", "blocked.example", "a.example", "b.example", "c.example", "d.example"]
+			}
+		],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`
+
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	resultJSON := gjson.ParseBytes(result)
+
+	if got := resultJSON.Get("tools.0.type").String(); got != "web_search" {
+		t.Fatalf("tools.0.type = %q, want web_search. Output: %s", got, string(result))
+	}
+	if got := resultJSON.Get("tools.0.filters.excluded_domains.#").Int(); got != 5 {
+		t.Fatalf("tools.0.filters.excluded_domains.# = %d, want 5. Output: %s", got, string(result))
+	}
+	if got := resultJSON.Get("tools.0.filters.excluded_domains.0").String(); got != "blocked.example" {
+		t.Fatalf("tools.0.filters.excluded_domains.0 = %q, want blocked.example. Output: %s", got, string(result))
+	}
+	if resultJSON.Get("tools.0.filters.allowed_domains").Exists() {
+		t.Fatalf("tools.0.filters.allowed_domains should be omitted for blocked-only filters. Output: %s", string(result))
 	}
 }
 
@@ -557,4 +591,41 @@ func validCodexReasoningSignature() string {
 	raw[0] = 0x80
 	raw[8] = 1
 	return base64.URLEncoding.EncodeToString(raw)
+}
+
+func TestConvertClaudeRequestToCodex_ServerWebSearchHistory(t *testing.T) {
+	inputJSON := `{
+		"model": "claude-3-opus",
+		"messages": [
+			{"role":"user","content":"search weather"},
+			{"role":"assistant","content":[
+				{"type":"server_tool_use","id":"ws_hist","name":"web_search","input":{"query":"weather beijing"}},
+				{"type":"web_search_tool_result","tool_use_id":"ws_hist","content":[{"type":"web_search_result","title":"Weather","url":"https://example.com/weather"}]},
+				{"type":"text","text":"It is sunny."}
+			]},
+			{"role":"user","content":"thanks"}
+		]
+	}`
+	result := ConvertClaudeRequestToCodex("test-model", []byte(inputJSON), false)
+	root := gjson.ParseBytes(result)
+	found := false
+	root.Get("input").ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() != "web_search_call" {
+			return true
+		}
+		if item.Get("id").String() != "ws_hist" {
+			return true
+		}
+		found = true
+		if got := item.Get("action.query").String(); got != "weather beijing" {
+			t.Fatalf("action.query = %q, want weather beijing: %s", got, result)
+		}
+		if got := item.Get("action.sources.0.url").String(); got != "https://example.com/weather" {
+			t.Fatalf("action.sources.0.url = %q: %s", got, result)
+		}
+		return false
+	})
+	if !found {
+		t.Fatalf("expected web_search_call history item, got: %s", result)
+	}
 }

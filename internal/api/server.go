@@ -35,6 +35,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/usagekeeper"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
@@ -238,6 +239,9 @@ type Server struct {
 	// pluginHost owns dynamic plugin Management API route dispatch.
 	pluginHost *pluginhost.Host
 
+	// usageKeeper manages the optional embedded CPA Usage Keeper sidecar.
+	usageKeeper *usagekeeper.Manager
+
 	// managementRoutesRegistered tracks whether the management routes have been attached to the engine.
 	managementRoutesRegistered atomic.Bool
 	// managementRoutesEnabled controls whether management endpoints serve real handlers.
@@ -332,6 +336,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
 		pluginHost:          optionState.pluginHost,
+		usageKeeper:         usagekeeper.New(configFilePath),
 
 		exampleAPIKeySafeModeEnabled: optionState.exampleAPIKeySafeMode,
 	}
@@ -355,6 +360,26 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetPluginHost(optionState.pluginHost)
+	s.mgmt.SetUsageKeeperStatusProvider(func() map[string]any {
+		if s.usageKeeper == nil {
+			return map[string]any{"enabled": false, "running": false}
+		}
+		return s.usageKeeper.Status()
+	})
+	s.mgmt.SetUsageKeeperEnsureProvider(func(managementKey string) map[string]any {
+		if s.usageKeeper == nil {
+			return map[string]any{"enabled": false, "running": false}
+		}
+		_ = s.usageKeeper.EnsureWithKey(s.cfg, s.usageKeeperPublicBaseURL(), managementKey)
+		return s.usageKeeper.Status()
+	})
+	s.mgmt.SetUsageKeeperCaptureProvider(func(managementKey string) {
+		if s.usageKeeper == nil {
+			return
+		}
+		// Persist runtime key and hot-restart sidecar when management password changes.
+		_ = s.usageKeeper.EnsureWithKey(s.cfg, s.usageKeeperPublicBaseURL(), managementKey)
+	})
 	s.mgmt.SetConfigReloadHook(optionState.configReloadHook)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
@@ -508,6 +533,10 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	// Embedded CPA Usage Keeper dashboard (same-origin iframe for management UI).
+	s.engine.Any("/usage-keeper", s.serveUsageKeeper)
+	s.engine.Any("/usage-keeper/*path", s.serveUsageKeeper)
+
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
@@ -718,6 +747,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
 
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
+		mgmt.GET("/usage-keeper/status", s.mgmt.GetUsageKeeperStatus)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 
@@ -934,6 +964,40 @@ func (s *Server) pluginResourceNoRoute(c *gin.Context) {
 		return
 	}
 	c.AbortWithStatus(http.StatusNotFound)
+}
+
+func (s *Server) serveUsageKeeper(c *gin.Context) {
+	if s == nil || s.usageKeeper == nil || !s.usageKeeper.Enabled() {
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"error": "usage-keeper is not enabled or not running",
+			"hint":  "set usage-keeper.enabled=true, provide binary + management-key, then restart CPA",
+		})
+		return
+	}
+	s.usageKeeper.ServeHTTP(c.Writer, c.Request)
+	c.Abort()
+}
+
+func (s *Server) usageKeeperPublicBaseURL() string {
+	if s == nil || s.cfg == nil {
+		return "http://127.0.0.1:8317"
+	}
+	host := strings.TrimSpace(s.cfg.Host)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	scheme := "http"
+	if s.cfg.TLS.Enable {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, host, s.cfg.Port)
+}
+
+func (s *Server) applyUsageKeeper(cfg *config.Config) {
+	if s == nil || s.usageKeeper == nil {
+		return
+	}
+	s.usageKeeper.Apply(cfg, s.usageKeeperPublicBaseURL())
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {
@@ -1546,6 +1610,8 @@ func (s *Server) Start() error {
 	httpErrCh := make(chan error, 1)
 	acceptErrCh := make(chan error, 1)
 
+	s.applyUsageKeeper(s.cfg)
+
 	go func() {
 		httpErrCh <- s.server.Serve(httpListener)
 	}()
@@ -1605,6 +1671,9 @@ func (s *Server) Start() error {
 //   - error: An error if the server fails to stop
 func (s *Server) Stop(ctx context.Context) error {
 	log.Debug("Stopping API server...")
+	if s.usageKeeper != nil {
+		s.usageKeeper.Stop()
+	}
 
 	if s.keepAliveEnabled {
 		select {
@@ -1778,6 +1847,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
 	s.cfg = cfg
+	s.applyUsageKeeper(cfg)
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)

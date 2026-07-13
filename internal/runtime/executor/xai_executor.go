@@ -9,7 +9,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +55,9 @@ const (
 	xaiVideosPath               = "/videos"
 	xaiIdempotencyKeyMetaKey    = "idempotency_key"
 	xaiComposerModelPrefix      = "grok-composer-"
+	xaiGrokCLIProxyBaseURL      = "https://cli-chat-proxy.grok.com/v1"
+	xaiGrokCLIUserAgentPrefix   = "xai-grok-workspace/"
+	xaiDefaultGrokCLIVersion    = "0.2.93"
 )
 
 // XAIExecutor is a stateless executor for xAI Grok's Responses API.
@@ -79,6 +84,7 @@ func (e *XAIExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth)
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+	applyXAIGrokCLIProxyHeaders(req, auth, "")
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -114,10 +120,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		return e.executeVideos(ctx, auth, req, opts)
 	}
 
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, baseURL := xaiRequestCreds(auth)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
@@ -133,7 +136,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 	if err != nil {
 		return resp, err
 	}
-	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -157,7 +160,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 	}
 
 	data, err := io.ReadAll(httpResp.Body)
@@ -205,10 +208,7 @@ func (e *XAIExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.Aut
 }
 
 func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*xaiPreparedRequest, []byte, http.Header, error) {
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, baseURL := xaiRequestCreds(auth)
 
 	prepared, err := e.prepareResponsesRequestTo(ctx, req, opts, false, sdktranslator.FormatOpenAIResponse)
 	if err != nil {
@@ -227,7 +227,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	applyXAIHeaders(httpReq, auth, token, false, prepared.sessionID)
+	applyXAIHeaders(httpReq, auth, token, false, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, requestURL, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -253,7 +253,7 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		err = statusErr{code: httpResp.StatusCode, msg: string(data)}
+		err = newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 		return nil, nil, nil, err
 	}
 
@@ -455,10 +455,7 @@ func xaiBuildSSEFrame(eventName string, data []byte) []byte {
 }
 
 func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, endpointPath string) (resp cliproxyexecutor.Response, err error) {
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, baseURL := xaiRequestCreds(auth)
 	if endpointPath == "" {
 		endpointPath = xaiDefaultImageEndpointPath
 	}
@@ -468,7 +465,7 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return resp, err
 	}
-	applyXAIHeaders(httpReq, auth, token, false, "")
+	applyXAIHeaders(httpReq, auth, token, false, "", req.Model)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), req.Payload)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -493,17 +490,14 @@ func (e *XAIExecutor) executeImages(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
 }
 
 func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, baseURL := xaiRequestCreds(auth)
 
 	method := http.MethodPost
 	endpointPath := xaiVideosGenerationsPath
@@ -524,7 +518,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return resp, err
 	}
-	applyXAIHeaders(httpReq, auth, token, false, "")
+	applyXAIHeaders(httpReq, auth, token, false, "", req.Model)
 	if method == http.MethodPost {
 		key := xaiMetadataString(opts.Metadata, xaiIdempotencyKeyMetaKey)
 		if key == "" && opts.Headers != nil {
@@ -558,7 +552,7 @@ func (e *XAIExecutor) executeVideos(ctx context.Context, auth *cliproxyauth.Auth
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return resp, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return resp, newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 	}
 
 	return cliproxyexecutor.Response{Payload: data, Headers: httpResp.Header.Clone()}, nil
@@ -572,10 +566,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		return e.executeCompactionTriggerStream(ctx, auth, req, opts)
 	}
 
-	token, baseURL := xaiCreds(auth)
-	if baseURL == "" {
-		baseURL = xaiauth.DefaultAPIBaseURL
-	}
+	token, baseURL := xaiRequestCreds(auth)
 
 	prepared, err := e.prepareResponsesRequest(ctx, req, opts, true)
 	if err != nil {
@@ -591,7 +582,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 	if err != nil {
 		return nil, err
 	}
-	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID)
+	applyXAIHeaders(httpReq, auth, token, true, prepared.sessionID, prepared.baseModel)
 	e.recordXAIRequest(ctx, auth, url, httpReq.Header.Clone(), prepared.body)
 
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
@@ -613,7 +604,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 		}
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(data)}
+		return nil, newXAIStatusErr(httpResp.StatusCode, data, httpResp.Header)
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -741,6 +732,9 @@ func (e *XAIExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cl
 	if auth == nil {
 		return nil, statusErr{code: http.StatusInternalServerError, msg: "xai executor: auth is nil"}
 	}
+	if xaiIsGrokCLISession(auth) {
+		return nil, statusErr{code: http.StatusUnauthorized, msg: "xai grok cli session expired; run grok login and re-import"}
+	}
 	refreshToken := xaiMetadataString(auth.Metadata, "refresh_token")
 	if refreshToken == "" {
 		return auth, nil
@@ -837,6 +831,10 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	body, _ = sjson.DeleteBytes(body, "stream_options")
+	// xAI / Grok Responses rejects OpenAI-compatible top-level metadata.
+	// Claude Code still sends metadata.user_id for session routing; keep
+	// prompt_cache_key/session headers and drop metadata before upstream.
+	body, _ = sjson.DeleteBytes(body, "metadata")
 	body = normalizeXAITools(body)
 	body = normalizeXAIToolChoiceForTools(body)
 	var replayScope xaiReasoningReplayScope
@@ -908,7 +906,105 @@ func xaiCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
 	return token, baseURL
 }
 
-func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string) {
+func xaiRequestCreds(auth *cliproxyauth.Auth) (token, baseURL string) {
+	token, baseURL = xaiCreds(auth)
+	if xaiUsesGrokCLIProxy(auth) && xaiShouldUseGrokCLIProxyBaseURL(baseURL) {
+		return token, xaiGrokCLIProxyBaseURL
+	}
+	if baseURL == "" {
+		baseURL = xaiauth.DefaultAPIBaseURL
+	}
+	return token, baseURL
+}
+
+// xaiUsesGrokCLIProxy reports whether an auth entry uses the Grok Build OAuth
+// inference proxy. Consumer OAuth tokens are distinct from xAI API keys.
+func xaiUsesGrokCLIProxy(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if xaiIsGrokCLISession(auth) {
+		return true
+	}
+	return auth.AuthKind() == cliproxyauth.AuthKindOAuth
+}
+
+func xaiShouldUseGrokCLIProxyBaseURL(baseURL string) bool {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	defaultBaseURL := strings.TrimRight(xaiauth.DefaultAPIBaseURL, "/")
+	return trimmed == "" || strings.EqualFold(trimmed, defaultBaseURL)
+}
+
+func xaiAuthMetadataOrAttribute(auth *cliproxyauth.Auth, key string) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Metadata != nil {
+		if value := xaiMetadataString(auth.Metadata, key); value != "" {
+			return value
+		}
+	}
+	if auth.Attributes != nil {
+		return strings.TrimSpace(auth.Attributes[key])
+	}
+	return ""
+}
+
+func xaiAuthKind(auth *cliproxyauth.Auth) string {
+	kind := strings.ToLower(strings.TrimSpace(xaiAuthMetadataOrAttribute(auth, "auth_kind")))
+	kind = strings.ReplaceAll(kind, "-", "_")
+	return kind
+}
+
+func xaiIsGrokCLISession(auth *cliproxyauth.Auth) bool {
+	switch xaiAuthKind(auth) {
+	case "grok_cli_session", "grok_build_session", "cli_session":
+		return true
+	default:
+		return false
+	}
+}
+
+func xaiGrokCLIVersion(auth *cliproxyauth.Auth) string {
+	for _, key := range []string{"grok_cli_version", "grok_version", "x_grok_client_version"} {
+		if value := xaiAuthMetadataOrAttribute(auth, key); value != "" {
+			return value
+		}
+	}
+	return xaiDefaultGrokCLIVersion
+}
+
+func xaiGrokCLIModelOverride(auth *cliproxyauth.Auth, model string) string {
+	if parsed := thinking.ParseSuffix(strings.TrimSpace(model)); parsed.ModelName != "" {
+		return strings.TrimSpace(parsed.ModelName)
+	}
+	for _, key := range []string{"grok_model_override", "x_grok_model_override"} {
+		if value := xaiAuthMetadataOrAttribute(auth, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func applyXAIGrokCLIProxyHeaders(r *http.Request, auth *cliproxyauth.Auth, model string) {
+	if r == nil || !xaiUsesGrokCLIProxy(auth) {
+		return
+	}
+	version := xaiGrokCLIVersion(auth)
+	r.Header.Set("X-XAI-Token-Auth", "xai-grok-cli")
+	r.Header.Set("x-grok-client-version", version)
+	r.Header.Set("User-Agent", xaiGrokCLIUserAgentPrefix+version)
+	if clientID := xaiAuthMetadataOrAttribute(auth, "grok_client_identifier"); clientID != "" {
+		r.Header.Set("x-grok-client-identifier", clientID)
+	} else if clientID := xaiAuthMetadataOrAttribute(auth, "grok_agent_id"); clientID != "" {
+		r.Header.Set("x-grok-client-identifier", clientID)
+	}
+	if modelOverride := xaiGrokCLIModelOverride(auth, model); modelOverride != "" {
+		r.Header.Set("x-grok-model-override", modelOverride)
+	}
+}
+
+func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, model string) {
 	r.Header.Set("Content-Type", "application/json")
 	if strings.TrimSpace(token) != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
@@ -922,6 +1018,7 @@ func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, str
 	if sessionID != "" {
 		r.Header.Set("x-grok-conv-id", sessionID)
 	}
+	applyXAIGrokCLIProxyHeaders(r, auth, model)
 	var attrs map[string]string
 	if auth != nil {
 		attrs = auth.Attributes
@@ -1584,4 +1681,122 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 
 	patched, _ := sjson.SetRawBytes(eventData, "response.output", outputArray)
 	return patched
+}
+
+// xaiFreeUsageCooldown is used when Grok free-tier quota is exhausted for a rolling
+// 24-hour window. Upstream free-usage errors do not include a precise reset
+// timestamp, so we cool the credential for nearly a full day instead of the short
+// exponential 429 backoff that would immediately reselect the same exhausted auth.
+const xaiFreeUsageCooldown = 23 * time.Hour
+
+// newXAIStatusErr builds a status error and attaches a long RetryAfter for free-tier
+// usage exhaustion so the auth manager can skip the credential until the window
+// is likely to reset. Optional response headers are preserved for free-usage snapshots.
+func newXAIStatusErr(statusCode int, body []byte, headers ...http.Header) statusErr {
+	err := statusErr{code: statusCode, msg: string(body)}
+	if retryAfter := parseXAIRetryAfter(statusCode, body); retryAfter != nil {
+		err.retryAfter = retryAfter
+	}
+	if len(headers) > 0 && headers[0] != nil {
+		err.headers = headers[0].Clone()
+	}
+	return err
+}
+
+// xaiFreeUsageFromHeaders extracts free-tier token/request limits from xAI response headers.
+func xaiFreeUsageFromHeaders(headers http.Header) (limitTokens, remainingTokens, limitRequests, remainingRequests int64, ok bool) {
+	if headers == nil {
+		return 0, 0, 0, 0, false
+	}
+	limitTokens = headerInt64(headers, "x-ratelimit-limit-tokens")
+	remainingTokens = headerInt64(headers, "x-ratelimit-remaining-tokens")
+	limitRequests = headerInt64(headers, "x-ratelimit-limit-requests")
+	remainingRequests = headerInt64(headers, "x-ratelimit-remaining-requests")
+	if limitTokens <= 0 && remainingTokens <= 0 && limitRequests <= 0 && remainingRequests <= 0 {
+		return 0, 0, 0, 0, false
+	}
+	return limitTokens, remainingTokens, limitRequests, remainingRequests, true
+}
+
+// parseXAIFreeUsageTokens extracts actual/limit token counts from free-usage exhaustion bodies.
+func parseXAIFreeUsageTokens(body []byte) (used, limit int64, ok bool) {
+	if len(body) == 0 {
+		return 0, 0, false
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "error").String(),
+		gjson.GetBytes(body, "error.error").String(),
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	re := regexp.MustCompile(`(?i)tokens\s*\(\s*actual\s*/\s*limit\s*\)\s*:\s*([0-9][0-9,]*)\s*/\s*([0-9][0-9,]*)`)
+	for _, candidate := range candidates {
+		matches := re.FindStringSubmatch(candidate)
+		if len(matches) != 3 {
+			continue
+		}
+		usedVal, errUsed := strconv.ParseInt(strings.ReplaceAll(matches[1], ",", ""), 10, 64)
+		limitVal, errLimit := strconv.ParseInt(strings.ReplaceAll(matches[2], ",", ""), 10, 64)
+		if errUsed != nil || errLimit != nil || usedVal < 0 || limitVal <= 0 {
+			continue
+		}
+		return usedVal, limitVal, true
+	}
+	return 0, 0, false
+}
+
+func headerInt64(headers http.Header, key string) int64 {
+	if headers == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(headers.Get(key))
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+// isXAIFreeUsageExhaustedError reports whether the response body describes a Grok
+// free-tier usage exhaustion error (subscription:free-usage-exhausted).
+func isXAIFreeUsageExhaustedError(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	candidates := []string{
+		gjson.GetBytes(body, "code").String(),
+		gjson.GetBytes(body, "error.code").String(),
+		gjson.GetBytes(body, "error.error.code").String(),
+		gjson.GetBytes(body, "error").String(),
+		gjson.GetBytes(body, "error.error").String(),
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}
+	for _, candidate := range candidates {
+		lower := strings.ToLower(strings.TrimSpace(candidate))
+		if lower == "" {
+			continue
+		}
+		if strings.Contains(lower, "subscription:free-usage-exhausted") ||
+			strings.Contains(lower, "free-usage-exhausted") ||
+			(strings.Contains(lower, "included free usage") && strings.Contains(lower, "rolling 24-hour")) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseXAIRetryAfter returns a long cooldown for free-tier usage exhaustion. Other
+// 429s intentionally fall through to the manager's short exponential backoff.
+func parseXAIRetryAfter(statusCode int, body []byte) *time.Duration {
+	if statusCode != http.StatusTooManyRequests || !isXAIFreeUsageExhaustedError(body) {
+		return nil
+	}
+	retryAfter := xaiFreeUsageCooldown
+	return &retryAfter
 }
