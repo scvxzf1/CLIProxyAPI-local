@@ -533,6 +533,8 @@ func (s *Server) setupRoutes() {
 	s.engine.HEAD("/healthz", healthzHandler)
 
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
+	s.engine.GET("/credential-import", s.serveCredentialImportPage)
+	s.engine.GET("/credential-import/", s.serveCredentialImportPage)
 	// Embedded CPA Usage Keeper dashboard (same-origin iframe for management UI).
 	s.engine.Any("/usage-keeper", s.serveUsageKeeper)
 	s.engine.Any("/usage-keeper/*path", s.serveUsageKeeper)
@@ -849,6 +851,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
+		mgmt.GET("/credential-import/settings", s.mgmt.GetCredentialImportSettings)
+		mgmt.PUT("/credential-import/settings", s.mgmt.PutCredentialImportSettings)
+		mgmt.POST("/credential-import/preview", s.mgmt.PreviewCredentialImportFiles)
+		mgmt.POST("/credential-import/preview-text", s.mgmt.PreviewCredentialImportText)
+		mgmt.POST("/credential-import/preview-path", s.mgmt.PreviewCredentialImportPath)
+		mgmt.POST("/credential-import/execute", s.mgmt.ExecuteCredentialImport)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -976,6 +984,20 @@ func (s *Server) serveUsageKeeper(c *gin.Context) {
 	}
 	s.usageKeeper.ServeHTTP(c.Writer, c.Request)
 	c.Abort()
+}
+
+func (s *Server) serveCredentialImportPage(c *gin.Context) {
+	cfg := s.cfg
+	if cfg == nil || cfg.Home.Enabled || cfg.RemoteManagement.DisableControlPanel {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	page := managementasset.CredentialImportHTML()
+	if len(page) == 0 {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", page)
 }
 
 func (s *Server) usageKeeperPublicBaseURL() string {
