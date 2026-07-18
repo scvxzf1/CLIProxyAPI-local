@@ -46,6 +46,7 @@ const (
 	xaiNamespaceToolType        = "namespace"
 	xaiToolSearchType           = "tool_search"
 	xaiWebSearchToolType        = "web_search"
+	xaiAdditionalToolsInputType = "additional_tools"
 	xaiImagesGenerationsPath    = "/images/generations"
 	xaiImagesEditsPath          = "/images/edits"
 	xaiDefaultImageEndpointPath = xaiImagesGenerationsPath
@@ -835,6 +836,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	// Claude Code still sends metadata.user_id for session routing; keep
 	// prompt_cache_key/session headers and drop metadata before upstream.
 	body, _ = sjson.DeleteBytes(body, "metadata")
+	body = normalizeXAIAdditionalToolsInput(body)
 	body = normalizeXAITools(body)
 	body = normalizeXAIToolChoiceForTools(body)
 	var replayScope xaiReasoningReplayScope
@@ -1183,6 +1185,62 @@ func normalizeXAITools(body []byte) []byte {
 	return updated
 }
 
+// normalizeXAIAdditionalToolsInput promotes Codex's dynamic tool declarations
+// to the top-level tools array. The Grok Responses API does not recognize
+// additional_tools as a ModelInput variant.
+func normalizeXAIAdditionalToolsInput(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return body
+	}
+
+	inputItems := make([]json.RawMessage, 0, len(input.Array()))
+	tools := make([]json.RawMessage, 0)
+	if existingTools := gjson.GetBytes(body, "tools"); existingTools.IsArray() {
+		for _, tool := range existingTools.Array() {
+			tools = append(tools, json.RawMessage(tool.Raw))
+		}
+	}
+
+	changed := false
+	for _, item := range input.Array() {
+		if strings.TrimSpace(item.Get("type").String()) != xaiAdditionalToolsInputType {
+			inputItems = append(inputItems, json.RawMessage(item.Raw))
+			continue
+		}
+		changed = true
+		if additionalTools := item.Get("tools"); additionalTools.IsArray() {
+			for _, tool := range additionalTools.Array() {
+				tools = append(tools, json.RawMessage(tool.Raw))
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+
+	encodedInput, errMarshalInput := json.Marshal(inputItems)
+	if errMarshalInput != nil {
+		return body
+	}
+	updated, errSetInput := sjson.SetRawBytes(body, "input", encodedInput)
+	if errSetInput != nil {
+		return body
+	}
+	if len(tools) == 0 {
+		return updated
+	}
+	encodedTools, errMarshalTools := json.Marshal(tools)
+	if errMarshalTools != nil {
+		return body
+	}
+	updated, errSetTools := sjson.SetRawBytes(updated, "tools", encodedTools)
+	if errSetTools != nil {
+		return body
+	}
+	return updated
+}
+
 // normalizeXAIToolChoiceForTools drops tool_choice and parallel_tool_calls
 // when tools are absent or empty (including after normalizeXAITools filtering).
 // xAI rejects payloads that include tool_choice without any tools defined.
@@ -1208,7 +1266,9 @@ func normalizeXAIToolChoiceForTools(body []byte) []byte {
 func normalizeXAITool(tool gjson.Result) ([]byte, bool, bool) {
 	toolType := tool.Get("type").String()
 	changed := false
-	if toolType == xaiToolSearchType || toolType == xaiImageGenerationToolType {
+	// Keep image_generation: free Grok Build OAuth serves Imagine via the
+	// Responses API built-in tool. tool_search is still dropped as unsupported.
+	if toolType == xaiToolSearchType {
 		return nil, true, true
 	}
 	raw := []byte(tool.Raw)
