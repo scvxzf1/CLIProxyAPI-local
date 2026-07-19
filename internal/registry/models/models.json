@@ -620,15 +620,15 @@
       }
     },
     {
-      "id": "gemini-3-pro-preview",
+      "id": "gemini-3-pro",
       "object": "model",
       "created": 1737158400,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3 Pro Preview",
-      "name": "models/gemini-3-pro-preview",
+      "display_name": "Gemini 3 Pro",
+      "name": "models/gemini-3-pro",
       "version": "3.0",
-      "description": "Gemini 3 Pro Preview",
+      "description": "Gemini 3 Pro",
       "inputTokenLimit": 1048576,
       "outputTokenLimit": 65536,
       "supportedGenerationMethods": [
@@ -648,13 +648,13 @@
       }
     },
     {
-      "id": "gemini-3-flash-preview",
+      "id": "gemini-3-flash",
       "object": "model",
       "created": 1765929600,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3 Flash Preview",
-      "name": "models/gemini-3-flash-preview",
+      "display_name": "Gemini 3 Flash",
+      "name": "models/gemini-3-flash",
       "version": "3.0",
       "description": "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding.",
       "inputTokenLimit": 1048576,
@@ -678,15 +678,15 @@
       }
     },
     {
-      "id": "gemini-3.1-pro-preview",
+      "id": "gemini-3.1-pro",
       "object": "model",
       "created": 1771459200,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3.1 Pro Preview",
-      "name": "models/gemini-3.1-pro-preview",
+      "display_name": "Gemini 3.1 Pro",
+      "name": "models/gemini-3.1-pro",
       "version": "3.1",
-      "description": "Gemini 3.1 Pro Preview",
+      "description": "Gemini 3.1 Pro",
       "inputTokenLimit": 1048576,
       "outputTokenLimit": 65536,
       "supportedGenerationMethods": [
@@ -707,15 +707,15 @@
       }
     },
     {
-      "id": "gemini-3.1-flash-image-preview",
+      "id": "gemini-3.1-flash-image",
       "object": "model",
       "created": 1771459200,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3.1 Flash Image Preview",
-      "name": "models/gemini-3.1-flash-image-preview",
+      "display_name": "Gemini 3.1 Flash Image",
+      "name": "models/gemini-3.1-flash-image",
       "version": "3.1",
-      "description": "Gemini 3.1 Flash Image Preview",
+      "description": "Gemini 3.1 Flash Image",
       "inputTokenLimit": 1048576,
       "outputTokenLimit": 65536,
       "supportedGenerationMethods": [
@@ -735,13 +735,13 @@
       }
     },
     {
-      "id": "gemini-3.1-flash-lite-preview",
+      "id": "gemini-3.1-flash-lite",
       "object": "model",
       "created": 1776288000,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3.1 Flash Lite Preview",
-      "name": "models/gemini-3.1-flash-lite-preview",
+      "display_name": "Gemini 3.1 Flash Lite",
+      "name": "models/gemini-3.1-flash-lite",
       "version": "3.1",
       "description": "Our smallest and most cost effective model, built for at scale usage.",
       "inputTokenLimit": 1048576,
@@ -765,15 +765,15 @@
       }
     },
     {
-      "id": "gemini-3-pro-image-preview",
+      "id": "gemini-3-pro-image",
       "object": "model",
       "created": 1737158400,
       "owned_by": "google",
       "type": "gemini",
-      "display_name": "Gemini 3 Pro Image Preview",
-      "name": "models/gemini-3-pro-image-preview",
+      "display_name": "Gemini 3 Pro Image",
+      "name": "models/gemini-3-pro-image",
       "version": "3.0",
-      "description": "Gemini 3 Pro Image Preview",
+      "description": "Gemini 3 Pro Image",
       "inputTokenLimit": 1048576,
       "outputTokenLimit": 65536,
       "supportedGenerationMethods": [
@@ -1430,6 +1430,60 @@
       }
     },
     {
+      "id": "gpt-5.6-terra",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Terra",
+      "version": "gpt-5.6",
+      "description": "Balanced agentic coding model for everyday work.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Luna",
+      "version": "gpt-5.6",
+      "description": "Fast and affordable agentic coding model.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "config": {
+        "override_header": {
+          "user-agent": "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)",
+          "originator": "codex-tui"
+        }
+      }
+    },
+    {
       "id": "codex-auto-review",
       "object": "model",
       "created": 1776902400,
@@ -1521,6 +1575,84 @@
           "high",
           "xhigh"
         ]
+      }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Sol",
+      "version": "gpt-5.6",
+      "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Terra",
+      "version": "gpt-5.6",
+      "description": "Balanced agentic coding model for everyday work.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Luna",
+      "version": "gpt-5.6",
+      "description": "Fast and affordable agentic coding model.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "config": {
+        "override_header": {
+          "user-agent": "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)",
+          "originator": "codex-tui"
+        }
       }
     },
     {
@@ -1641,6 +1773,84 @@
       }
     },
     {
+      "id": "gpt-5.6-sol",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Sol",
+      "version": "gpt-5.6",
+      "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Terra",
+      "version": "gpt-5.6",
+      "description": "Balanced agentic coding model for everyday work.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Luna",
+      "version": "gpt-5.6",
+      "description": "Fast and affordable agentic coding model.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "config": {
+        "override_header": {
+          "user-agent": "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)",
+          "originator": "codex-tui"
+        }
+      }
+    },
+    {
       "id": "codex-auto-review",
       "object": "model",
       "created": 1776902400,
@@ -1758,6 +1968,84 @@
       }
     },
     {
+      "id": "gpt-5.6-sol",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Sol",
+      "version": "gpt-5.6",
+      "description": "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning efforts—try starting lower, then turn it up for harder jobs.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Terra",
+      "version": "gpt-5.6",
+      "description": "Balanced agentic coding model for everyday work.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "object": "model",
+      "created": 1783616400,
+      "owned_by": "openai",
+      "type": "openai",
+      "display_name": "GPT 5.6 Luna",
+      "version": "gpt-5.6",
+      "description": "Fast and affordable agentic coding model.",
+      "context_length": 372000,
+      "max_completion_tokens": 128000,
+      "supported_parameters": [
+        "tools"
+      ],
+      "thinking": {
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "config": {
+        "override_header": {
+          "user-agent": "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)",
+          "originator": "codex-tui"
+        }
+      }
+    },
+    {
       "id": "codex-auto-review",
       "object": "model",
       "created": 1776902400,
@@ -1804,13 +2092,9 @@
       "context_length": 131072,
       "max_completion_tokens": 32768,
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": true,
-        "dynamic_allowed": true,
         "levels": [
           "low",
-          "medium",
           "high"
         ]
       }
@@ -1826,13 +2110,9 @@
       "context_length": 262144,
       "max_completion_tokens": 32768,
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": true,
-        "dynamic_allowed": true,
         "levels": [
           "low",
-          "medium",
           "high"
         ]
       }
@@ -1848,13 +2128,9 @@
       "context_length": 262144,
       "max_completion_tokens": 65536,
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": true,
-        "dynamic_allowed": true,
         "levels": [
           "low",
-          "medium",
           "high"
         ]
       }
@@ -1870,13 +2146,9 @@
       "context_length": 262144,
       "max_completion_tokens": 65536,
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": false,
-        "dynamic_allowed": true,
         "levels": [
           "low",
-          "medium",
           "high"
         ]
       }
@@ -1892,14 +2164,29 @@
       "context_length": 262144,
       "max_completion_tokens": 65536,
       "thinking": {
-        "min": 1024,
-        "max": 32000,
         "zero_allowed": false,
-        "dynamic_allowed": true,
         "levels": [
           "low",
-          "medium",
           "high"
+        ]
+      }
+    },
+    {
+      "id": "kimi-k3",
+      "object": "model",
+      "created": 1784073600,
+      "owned_by": "moonshot",
+      "type": "kimi",
+      "display_name": "Kimi K3",
+      "description": "Kimi K3 - Moonshot AI's next-generation flagship model (~2.8T MoE) with multimodal input",
+      "context_length": 262144,
+      "max_completion_tokens": 65536,
+      "thinking": {
+        "zero_allowed": false,
+        "levels": [
+          "low",
+          "high",
+          "max"
         ]
       }
     }
@@ -2145,7 +2432,7 @@
       "context_length": 500000,
       "max_completion_tokens": 65536,
       "thinking": {
-        "zero_allowed": true,
+        "zero_allowed": false,
         "levels": [
           "low",
           "medium",

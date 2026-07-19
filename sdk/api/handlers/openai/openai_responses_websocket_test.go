@@ -660,6 +660,188 @@ func TestNormalizeResponsesWebsocketRequestSkipsPreviousResponseIDWhenPendingOut
 	}
 }
 
+func TestNormalizeResponsesWebsocketRequestReplacesCodexLocalCompactionTranscript(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.6-sol","stream":true,"instructions":"be helpful","input":[
+		{"type":"message","role":"user","id":"old-user","content":[{"type":"input_text","text":"old prompt"}]},
+		{"type":"function_call_output","id":"old-tool-output","call_id":"old-call","output":"old result"}
+	]}`)
+	lastResponseOutput := []byte(`[
+		{"type":"function_call","id":"old-tool-call","call_id":"old-call","name":"lookup","arguments":"{}"},
+		{"type":"message","role":"assistant","id":"old-assistant","content":[{"type":"output_text","text":"old answer"}]}
+	]`)
+	raw := []byte(fmt.Sprintf(`{"type":"response.create","input":[
+		{"type":"additional_tools","role":"developer","tools":[]},
+		{"role":"developer","id":"initial-context","content":"workspace context"},
+		{"type":"message","role":"user","id":"compacted-user","content":[{"type":"input_text","text":"retained context"}]},
+		{"role":"user","id":"local-summary","content":%q},
+		{"type":"message","role":"developer","id":"turn-context","content":[{"type":"input_text","text":"current workspace context"}]},
+		{"role":"user","id":"incoming-user","content":"continue the task"}
+	],"parallel_tool_calls":true,"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`, codexLocalCompactionSummaryPrefix+"\nThe compacted summary."))
+
+	normalized, next, errMsg := normalizeResponsesWebsocketRequestWithMode(raw, lastRequest, lastResponseOutput, false, false)
+	if errMsg != nil {
+		t.Fatalf("unexpected error: %v", errMsg.Error)
+	}
+	if gjson.GetBytes(normalized, "previous_response_id").Exists() {
+		t.Fatalf("replacement request must not include previous_response_id: %s", normalized)
+	}
+	if got, want := gjson.GetBytes(normalized, "input").Raw, gjson.GetBytes(raw, "input").Raw; got != want {
+		t.Fatalf("replacement input did not preserve the complete new transcript:\n got: %s\nwant: %s", got, want)
+	}
+	input := gjson.GetBytes(normalized, "input").Array()
+	wantIDs := []string{"", "initial-context", "compacted-user", "local-summary", "turn-context", "incoming-user"}
+	if len(input) != len(wantIDs) {
+		t.Fatalf("replacement input len = %d, want %d: %s", len(input), len(wantIDs), normalized)
+	}
+	for index, wantID := range wantIDs {
+		if got := input[index].Get("id").String(); got != wantID {
+			t.Fatalf("replacement input[%d].id = %q, want %q: %s", index, got, wantID, normalized)
+		}
+	}
+	if got := input[0].Get("type").String(); got != "additional_tools" {
+		t.Fatalf("input[0].type = %q, want additional_tools: %s", got, normalized)
+	}
+	if got := input[0].Get("role").String(); got != "developer" {
+		t.Fatalf("input[0].role = %q, want developer: %s", got, normalized)
+	}
+	if tools := input[0].Get("tools"); !tools.IsArray() || len(tools.Array()) != 0 {
+		t.Fatalf("input[0] empty tools array was not preserved: %s", normalized)
+	}
+	for _, staleID := range []string{"old-user", "old-tool-output", "old-tool-call", "old-assistant"} {
+		if bytes.Contains(normalized, []byte(staleID)) {
+			t.Fatalf("replacement input contains stale item %q: %s", staleID, normalized)
+		}
+	}
+	if got := gjson.GetBytes(normalized, "model").String(); got != "gpt-5.6-sol" {
+		t.Fatalf("model = %q, want gpt-5.6-sol", got)
+	}
+	if got := gjson.GetBytes(normalized, "instructions").String(); got != "be helpful" {
+		t.Fatalf("instructions = %q, want be helpful", got)
+	}
+	if !gjson.GetBytes(normalized, "stream").Bool() {
+		t.Fatalf("stream must be enabled: %s", normalized)
+	}
+	if !gjson.GetBytes(normalized, "parallel_tool_calls").Bool() {
+		t.Fatalf("parallel_tool_calls was not preserved: %s", normalized)
+	}
+	if got := gjson.GetBytes(normalized, "client_metadata.ws_request_header_x_openai_internal_codex_responses_lite").String(); got != "true" {
+		t.Fatalf("Responses Lite client metadata = %q, want true: %s", got, normalized)
+	}
+	if !bytes.Equal(next, normalized) {
+		t.Fatalf("next request snapshot should match normalized request")
+	}
+}
+
+func TestShouldReplaceWebsocketTranscriptCodexLocalCompactionSemantics(t *testing.T) {
+	compactedInput := gjson.Parse(fmt.Sprintf(`[
+		{"type":"message","role":"developer","content":[{"type":"input_text","text":"initial context"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"retained context"}]},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}
+	]`, codexLocalCompactionSummaryPrefix+"\nSummary body."))
+	if !shouldReplaceWebsocketTranscript([]byte(`{"type":"response.create"}`), compactedInput) {
+		t.Fatal("Codex local compaction input must replace the websocket transcript")
+	}
+	for _, request := range []string{
+		`{"type":"response.create","previous_response_id":"resp-1"}`,
+		`{"type":"response.create","previous_response_id":""}`,
+		`{"type":"response.create","previous_response_id":null}`,
+	} {
+		if shouldReplaceWebsocketTranscript([]byte(request), compactedInput) {
+			t.Fatalf("request carrying previous_response_id must not use the local compaction rule: %s", request)
+		}
+	}
+	if shouldReplaceWebsocketTranscript([]byte(`{"type":"response.append"}`), compactedInput) {
+		t.Fatal("response.append must not be treated as a full local compaction reset")
+	}
+
+	ordinaryInput := gjson.Parse(`[
+		{"type":"message","role":"developer","content":"Please summarize future messages."},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"Please create a compacted summary of this text."}]}
+	]`)
+	if shouldReplaceWebsocketTranscript([]byte(`{"type":"response.create"}`), ordinaryInput) {
+		t.Fatal("ordinary user/developer input must not replace the transcript")
+	}
+}
+
+func TestCodexLocalCompactionSummaryContentShapes(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "string content", content: fmt.Sprintf(`%q`, codexLocalCompactionSummaryPrefix+"\nSummary body."), want: true},
+		{name: "multiple input text parts", content: fmt.Sprintf(`[{"type":"input_text","text":%q},{"type":"input_text","text":"\nSummary body."}]`, codexLocalCompactionSummaryPrefix), want: true},
+		{name: "non-text part before summary", content: fmt.Sprintf(`[{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":%q}]`, codexLocalCompactionSummaryPrefix+"\nSummary body."), want: true},
+		{name: "bare prefix", content: fmt.Sprintf(`%q`, codexLocalCompactionSummaryPrefix), want: false},
+		{name: "prefix followed by space", content: fmt.Sprintf(`%q`, codexLocalCompactionSummaryPrefix+" Summary body."), want: false},
+		{name: "summary after ordinary text", content: fmt.Sprintf(`[{"type":"input_text","text":"ordinary text"},{"type":"input_text","text":%q}]`, codexLocalCompactionSummaryPrefix+"\nSummary body."), want: false},
+		{name: "developer summary", content: fmt.Sprintf(`%q`, codexLocalCompactionSummaryPrefix+"\nSummary body."), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			role := "user"
+			if test.name == "developer summary" {
+				role = "developer"
+			}
+			input := gjson.Parse(fmt.Sprintf(`[{"type":"message","role":%q,"content":%s}]`, role, test.content))
+			if got := inputHasCodexLocalCompactionSummary(input); got != test.want {
+				t.Fatalf("inputHasCodexLocalCompactionSummary() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexLocalCompactionSummaryAdditionalToolsConstraints(t *testing.T) {
+	summary := fmt.Sprintf(`{"role":"user","content":%q}`, codexLocalCompactionSummaryPrefix+"\nSummary body.")
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "Responses Lite tools first", input: fmt.Sprintf(`[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]},%s]`, summary), want: true},
+		{name: "tools after message", input: fmt.Sprintf(`[%s,{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]}]`, summary)},
+		{name: "tools with user role", input: fmt.Sprintf(`[{"type":"additional_tools","role":"user","tools":[{"type":"custom","name":"exec"}]},%s]`, summary)},
+		{name: "tools missing array", input: fmt.Sprintf(`[{"type":"additional_tools","role":"developer"},%s]`, summary)},
+		{name: "tools not array", input: fmt.Sprintf(`[{"type":"additional_tools","role":"developer","tools":{}},%s]`, summary)},
+		{name: "tools empty", input: fmt.Sprintf(`[{"type":"additional_tools","role":"developer","tools":[]},%s]`, summary), want: true},
+		{name: "malformed tool", input: fmt.Sprintf(`[{"type":"additional_tools","role":"developer","tools":[null]},%s]`, summary)},
+		{name: "arbitrary input item", input: fmt.Sprintf(`[{"type":"unknown","role":"developer"},%s]`, summary)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := inputHasCodexLocalCompactionSummary(gjson.Parse(test.input)); got != test.want {
+				t.Fatalf("inputHasCodexLocalCompactionSummary() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestCodexLocalCompactionSummaryRejectsOrdinaryHistoryItems(t *testing.T) {
+	tests := []struct {
+		name        string
+		historyItem string
+		wantReplace bool
+	}{
+		{name: "reasoning", historyItem: `{"type":"reasoning","id":"reasoning-1"}`},
+		{name: "assistant", historyItem: `{"type":"message","role":"assistant","id":"assistant-1"}`, wantReplace: true},
+		{name: "function call", historyItem: `{"type":"function_call","call_id":"call-1"}`, wantReplace: true},
+		{name: "function call output", historyItem: `{"type":"function_call_output","call_id":"call-1"}`},
+		{name: "custom tool call", historyItem: `{"type":"custom_tool_call","call_id":"call-1"}`, wantReplace: true},
+		{name: "custom tool call output", historyItem: `{"type":"custom_tool_call_output","call_id":"call-1"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := gjson.Parse(fmt.Sprintf(`[%s,{"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}]`, test.historyItem, codexLocalCompactionSummaryPrefix+"\nSummary body."))
+			if inputHasCodexLocalCompactionSummary(input) {
+				t.Fatal("ordinary transcript history must not match the local user-summary shape")
+			}
+			if got := shouldReplaceWebsocketTranscript([]byte(`{"type":"response.create"}`), input); got != test.wantReplace {
+				t.Fatalf("shouldReplaceWebsocketTranscript() = %t, want %t", got, test.wantReplace)
+			}
+		})
+	}
+}
+
 func TestNormalizeResponsesWebsocketRequestWithPreviousResponseIDMergedWhenIncrementalDisabled(t *testing.T) {
 	lastRequest := []byte(`{"model":"test-model","stream":true,"input":[{"type":"message","id":"msg-1"}]}`)
 	lastResponseOutput := []byte(`[
@@ -757,13 +939,23 @@ func TestWebsocketJSONPayloadsFromPlainJSONChunk(t *testing.T) {
 func TestResponseCompletedOutputFromPayload(t *testing.T) {
 	payload := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","id":"out-1"}]}}`)
 
-	output := responseCompletedOutputFromPayload(payload)
+	output := responseCompletedOutputFromPayload(payload, nil, nil)
 	items := gjson.ParseBytes(output).Array()
 	if len(items) != 1 {
 		t.Fatalf("output len = %d, want 1", len(items))
 	}
 	if items[0].Get("id").String() != "out-1" {
 		t.Fatalf("unexpected output id: %s", items[0].Get("id").String())
+	}
+}
+
+func TestRestoreResponsesWebsocketCompletionOutputPreservesNonEmptyOutput(t *testing.T) {
+	payload := []byte(`{"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","id":"out-1"}]}}`)
+	collector := map[int64][]byte{0: []byte(`{"type":"function_call","id":"call-1","call_id":"call-1"}`)}
+
+	restored := restoreResponsesWebsocketCompletionOutput(payload, collector, nil)
+	if string(restored) != string(payload) {
+		t.Fatalf("non-empty completion output was overwritten: %s", restored)
 	}
 }
 
@@ -1147,7 +1339,7 @@ func TestRecordResponsesWebsocketCustomToolCallsFromOutputItemDoneWithCache(t *t
 	}
 }
 
-func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
+func TestForwardResponsesWebsocketRestoresAndForwardsCompletedOutput(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	serverErrCh := make(chan error, 1)
@@ -1167,9 +1359,10 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx.Request = r
 
-		data := make(chan []byte, 1)
+		data := make(chan []byte, 2)
 		errCh := make(chan *interfaces.ErrorMessage)
-		data <- []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"message\",\"id\":\"out-1\"}]}}\n\n")
+		data <- []byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"call-1","call_id":"call-1","name":"lookup","arguments":"{}"}}`)
+		data <- []byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[]}}\n\n")
 		close(data)
 		close(errCh)
 
@@ -1191,16 +1384,16 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 			serverErrCh <- fmt.Errorf("unexpected websocket error message: %v", errMsg.Error)
 			return
 		}
-		if gjson.GetBytes(completedOutput, "0.id").String() != "out-1" {
-			serverErrCh <- errors.New("completed output not captured")
+		if gjson.GetBytes(completedOutput, "0.id").String() != "call-1" {
+			serverErrCh <- errors.New("completed output not restored")
 			return
 		}
 		if completedResponseID != "resp-1" {
 			serverErrCh <- fmt.Errorf("completed response id = %q, want resp-1", completedResponseID)
 			return
 		}
-		if len(pendingToolCallIDs) != 0 {
-			serverErrCh <- fmt.Errorf("pending tool call ids = %v, want empty", pendingToolCallIDs)
+		if len(pendingToolCallIDs) != 1 || pendingToolCallIDs[0] != "call-1" {
+			serverErrCh <- fmt.Errorf("pending tool call ids = %v, want [call-1]", pendingToolCallIDs)
 			return
 		}
 		if !strings.Contains(timelineLog.String(), "Event: websocket.response") {
@@ -1223,15 +1416,26 @@ func TestForwardResponsesWebsocketPreservesCompletedEvent(t *testing.T) {
 		}
 	}()
 
+	_, outputItemPayload, errReadMessage := conn.ReadMessage()
+	if errReadMessage != nil {
+		t.Fatalf("read output item websocket message: %v", errReadMessage)
+	}
+	if got := gjson.GetBytes(outputItemPayload, "type").String(); got != "response.output_item.done" {
+		t.Fatalf("output item payload type = %s, want response.output_item.done", got)
+	}
+
 	_, payload, errReadMessage := conn.ReadMessage()
 	if errReadMessage != nil {
-		t.Fatalf("read websocket message: %v", errReadMessage)
+		t.Fatalf("read completion websocket message: %v", errReadMessage)
 	}
 	if gjson.GetBytes(payload, "type").String() != wsEventTypeCompleted {
 		t.Fatalf("payload type = %s, want %s", gjson.GetBytes(payload, "type").String(), wsEventTypeCompleted)
 	}
 	if strings.Contains(string(payload), "response.done") {
 		t.Fatalf("payload unexpectedly rewrote completed event: %s", payload)
+	}
+	if got := gjson.GetBytes(payload, "response.output.0.id").String(); got != "call-1" {
+		t.Fatalf("downstream completion output id = %q, want call-1; payload=%s", got, payload)
 	}
 
 	if errServer := <-serverErrCh; errServer != nil {
@@ -1744,6 +1948,179 @@ func TestResponsesWebsocketXAIWebsocketPassthroughCarriesPreviousResponseID(t *t
 	authIDs := executor.AuthIDs()
 	if len(authIDs) != 2 || authIDs[0] != "auth-xai-ws" || authIDs[1] != "auth-xai-ws" {
 		t.Fatalf("xai websocket auth IDs = %v, want [auth-xai-ws auth-xai-ws]", authIDs)
+	}
+}
+
+func TestResponsesWebsocketSwitchesPinnedAuthAcrossProviders(t *testing.T) {
+	for _, testCase := range []struct {
+		name                      string
+		xaiWebsockets             bool
+		returnToDifferentXAIModel bool
+	}{
+		{name: "xai SSE", xaiWebsockets: false},
+		{name: "xai websocket", xaiWebsockets: true},
+		{name: "xai websocket different model", xaiWebsockets: true, returnToDifferentXAIModel: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+
+			xaiModel := "xai-provider-switch-" + strings.ReplaceAll(testCase.name, " ", "-")
+			returnXAIModel := xaiModel
+			if testCase.returnToDifferentXAIModel {
+				returnXAIModel += "-return"
+			}
+			codexModel := "codex-provider-switch-" + strings.ReplaceAll(testCase.name, " ", "-")
+			xaiExecutor := &websocketDirectCaptureExecutor{provider: "xai"}
+			codexExecutor := &websocketDirectCaptureExecutor{provider: "codex"}
+
+			xaiAuth := &coreauth.Auth{
+				ID:       "auth-" + xaiModel,
+				Provider: "xai",
+				Status:   coreauth.StatusActive,
+			}
+			if testCase.xaiWebsockets {
+				xaiAuth.Attributes = map[string]string{"websockets": "true"}
+			}
+			codexAuth := &coreauth.Auth{
+				ID:         "auth-" + codexModel,
+				Provider:   "codex",
+				Status:     coreauth.StatusActive,
+				Attributes: map[string]string{"websockets": "true"},
+			}
+			selector := &orderedWebsocketSelector{order: []string{xaiAuth.ID, codexAuth.ID}}
+			manager := coreauth.NewManager(nil, selector, nil)
+			manager.RegisterExecutor(xaiExecutor)
+			manager.RegisterExecutor(codexExecutor)
+			if _, errRegister := manager.Register(context.Background(), xaiAuth); errRegister != nil {
+				t.Fatalf("Register xAI auth: %v", errRegister)
+			}
+			if _, errRegister := manager.Register(context.Background(), codexAuth); errRegister != nil {
+				t.Fatalf("Register Codex auth: %v", errRegister)
+			}
+
+			registry.GetGlobalRegistry().RegisterClient(xaiAuth.ID, xaiAuth.Provider, []*registry.ModelInfo{{ID: xaiModel}})
+			registry.GetGlobalRegistry().RegisterClient(codexAuth.ID, codexAuth.Provider, []*registry.ModelInfo{{ID: codexModel}})
+			registeredAuthIDs := []string{xaiAuth.ID, codexAuth.ID}
+			xaiAlternateAuthID := ""
+			if testCase.xaiWebsockets {
+				xaiAlternateAuth := &coreauth.Auth{
+					ID:         "auth-alternate-" + xaiModel,
+					Provider:   "xai",
+					Status:     coreauth.StatusActive,
+					Attributes: map[string]string{"websockets": "true"},
+				}
+				xaiAlternateAuthID = xaiAlternateAuth.ID
+				selector.order = append(selector.order, xaiAlternateAuth.ID)
+				if _, errRegister := manager.Register(context.Background(), xaiAlternateAuth); errRegister != nil {
+					t.Fatalf("Register alternate xAI auth: %v", errRegister)
+				}
+				alternateModels := []*registry.ModelInfo{{ID: xaiModel}}
+				if testCase.returnToDifferentXAIModel {
+					alternateModels = []*registry.ModelInfo{{ID: returnXAIModel}}
+				}
+				registry.GetGlobalRegistry().RegisterClient(xaiAlternateAuth.ID, xaiAlternateAuth.Provider, alternateModels)
+				registeredAuthIDs = append(registeredAuthIDs, xaiAlternateAuth.ID)
+			}
+			t.Cleanup(func() {
+				for _, authID := range registeredAuthIDs {
+					registry.GetGlobalRegistry().UnregisterClient(authID)
+				}
+			})
+
+			base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+			h := NewOpenAIResponsesAPIHandler(base)
+			router := gin.New()
+			router.GET("/v1/responses/ws", h.ResponsesWebsocket)
+
+			server := httptest.NewServer(router)
+			defer server.Close()
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses/ws"
+			conn, _, errDial := websocket.DefaultDialer.Dial(wsURL, nil)
+			if errDial != nil {
+				t.Fatalf("dial websocket: %v", errDial)
+			}
+			defer func() {
+				if errClose := conn.Close(); errClose != nil {
+					t.Errorf("close websocket: %v", errClose)
+				}
+			}()
+
+			requests := []string{
+				fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-xai-1"}]}`, xaiModel),
+				fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-codex-1"}]}`, codexModel),
+				fmt.Sprintf(`{"type":"response.create","model":%q,"input":[{"type":"message","id":"msg-xai-2"}]}`, returnXAIModel),
+				`{"type":"response.create","input":[{"type":"message","id":"msg-xai-3"}]}`,
+			}
+			for index, request := range requests {
+				if errWrite := conn.WriteMessage(websocket.TextMessage, []byte(request)); errWrite != nil {
+					t.Fatalf("write websocket message %d: %v", index+1, errWrite)
+				}
+				_, payload, errRead := conn.ReadMessage()
+				if errRead != nil {
+					t.Fatalf("read websocket response %d: %v", index+1, errRead)
+				}
+				if got := gjson.GetBytes(payload, "type").String(); got != wsEventTypeCompleted {
+					t.Fatalf("response %d type = %s, want %s: %s", index+1, got, wsEventTypeCompleted, payload)
+				}
+			}
+
+			wantReturnAuthID := xaiAuth.ID
+			if testCase.returnToDifferentXAIModel {
+				wantReturnAuthID = xaiAlternateAuthID
+			}
+			if got := xaiExecutor.AuthIDs(); len(got) != 3 || got[0] != xaiAuth.ID || got[1] != wantReturnAuthID || got[2] != wantReturnAuthID {
+				t.Fatalf("xAI auth IDs = %v, want [%s %s %s]", got, xaiAuth.ID, wantReturnAuthID, wantReturnAuthID)
+			}
+			if got := codexExecutor.AuthIDs(); len(got) != 1 || got[0] != codexAuth.ID {
+				t.Fatalf("Codex auth IDs = %v, want [%s]", got, codexAuth.ID)
+			}
+		})
+	}
+}
+
+func TestResponsesWebsocketPinnedAuthMatchesModel(t *testing.T) {
+	modelA := "xai-pinned-auth-model-a"
+	modelB := "xai-pinned-auth-model-b"
+	auth := &coreauth.Auth{ID: "xai-pinned-auth", Provider: "xai", Status: coreauth.StatusActive}
+	otherAuthID := "xai-pinned-auth-other"
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: modelA}})
+	registry.GetGlobalRegistry().RegisterClient(otherAuthID, auth.Provider, []*registry.ModelInfo{{ID: modelB}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+		registry.GetGlobalRegistry().UnregisterClient(otherAuthID)
+	})
+
+	if !responsesWebsocketPinnedAuthMatchesModel(auth, modelA, modelA, false) {
+		t.Fatal("expected registered auth to match its supported model")
+	}
+	if responsesWebsocketPinnedAuthMatchesModel(auth, modelB, modelA, false) {
+		t.Fatal("registered auth matched an unsupported model from the same provider")
+	}
+
+	disabledAuth := auth.Clone()
+	disabledAuth.Disabled = true
+	if responsesWebsocketPinnedAuthMatchesModel(disabledAuth, modelA, modelA, false) {
+		t.Fatal("disabled auth matched a model")
+	}
+
+	cooldownAuth := auth.Clone()
+	cooldownAuth.ModelStates = map[string]*coreauth.ModelState{
+		modelA: {Unavailable: true, NextRetryAfter: time.Now().Add(time.Minute)},
+	}
+	if responsesWebsocketPinnedAuthMatchesModel(cooldownAuth, modelA, modelA, false) {
+		t.Fatal("auth in model cooldown matched a model")
+	}
+
+	unregisteredAuth := &coreauth.Auth{ID: "unregistered-auth", Provider: "xai", Status: coreauth.StatusActive}
+	if responsesWebsocketPinnedAuthMatchesModel(unregisteredAuth, modelA, modelA, false) {
+		t.Fatal("unregistered ordinary auth matched a model")
+	}
+	if !responsesWebsocketPinnedAuthMatchesModel(unregisteredAuth, modelA, modelA, true) {
+		t.Fatal("expected Home runtime auth to match its pinned model")
+	}
+	if responsesWebsocketPinnedAuthMatchesModel(unregisteredAuth, modelB, modelA, true) {
+		t.Fatal("Home runtime auth matched a different model")
 	}
 }
 
@@ -3063,6 +3440,60 @@ func TestNormalizeSubsequentRequestCompactSkipsMerge(t *testing.T) {
 	}
 	if input[1].Get("type").String() != "compaction" {
 		t.Fatalf("input[1].type = %q, want %q", input[1].Get("type").String(), "compaction")
+	}
+}
+
+func TestNormalizeSubsequentRequestReasoningContinuationWithPreviousResponseID(t *testing.T) {
+	lastRequest := []byte(`{"model":"gpt-5.6-terra","stream":true,"input":[{"type":"message","role":"user","id":"old-user","content":"long history"}]}`)
+	lastResponseOutput := []byte(`[{"type":"function_call","id":"old-call","call_id":"old-call","name":"lookup","arguments":"{}"}]`)
+
+	for _, requestType := range []string{"response.create", "response.append"} {
+		t.Run(requestType, func(t *testing.T) {
+			raw := []byte(`{"type":"` + requestType + `","previous_response_id":"resp-1","input":[
+				{"type":"reasoning","id":"reasoning-1","summary":[]},
+				{"type":"function_call_output","id":"output-1","call_id":"old-call","output":"result"}
+			]}`)
+
+			normalized, _, errMsg := normalizeResponsesWebsocketRequest(raw, lastRequest, lastResponseOutput)
+			if errMsg != nil {
+				t.Fatalf("unexpected error: %v", errMsg.Error)
+			}
+			if got := gjson.GetBytes(normalized, "previous_response_id").String(); got != "resp-1" {
+				t.Fatalf("previous_response_id = %q, want resp-1; payload=%s", got, normalized)
+			}
+			input := gjson.GetBytes(normalized, "input").Array()
+			if len(input) != 2 || input[0].Get("id").String() != "reasoning-1" || input[1].Get("id").String() != "output-1" {
+				t.Fatalf("incremental continuation was replaced or merged: %s", normalized)
+			}
+		})
+	}
+}
+
+func TestResponsesWebsocketOutputCollectorRestoresCompletedOutput(t *testing.T) {
+	outputItemsByIndex := make(map[int64][]byte)
+	var outputItemsFallback [][]byte
+	for _, payload := range [][]byte{
+		[]byte(`{"type":"response.output_item.done","output_index":1,"item":{"type":"message","id":"reply-1","role":"assistant"}}`),
+		[]byte(`{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"summary-1","summary":[]}}`),
+		[]byte(`{"type":"response.output_item.done","item":{"type":"function_call","id":"call-1","call_id":"call-1"}}`),
+	} {
+		collectResponsesWebsocketOutputItem(payload, outputItemsByIndex, &outputItemsFallback)
+	}
+
+	output := responseCompletedOutputFromPayload(
+		[]byte(`{"type":"response.completed","response":{"id":"resp-1","output":[]}}`),
+		outputItemsByIndex,
+		outputItemsFallback,
+	)
+	items := gjson.ParseBytes(output).Array()
+	if len(items) != 3 {
+		t.Fatalf("collected output len = %d, want 3: %s", len(items), output)
+	}
+	wantIDs := []string{"summary-1", "reply-1", "call-1"}
+	for i, wantID := range wantIDs {
+		if got := items[i].Get("id").String(); got != wantID {
+			t.Fatalf("output[%d].id = %q, want %q: %s", i, got, wantID, output)
+		}
 	}
 }
 
