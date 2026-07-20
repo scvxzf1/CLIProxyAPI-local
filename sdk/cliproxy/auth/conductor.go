@@ -2247,12 +2247,18 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 // Remove deletes an auth from runtime state without persisting.
 // Disk and token-store deletion must be handled by the caller.
 func (m *Manager) Remove(ctx context.Context, id string) {
+	m.removeRuntimeAuth(ctx, id, nil)
+}
+
+// removeRuntimeAuth removes an auth only when its current credential still
+// matches expected. A nil expected value performs an unconditional removal.
+func (m *Manager) removeRuntimeAuth(ctx context.Context, id string, expected *Auth) *Auth {
 	if m == nil {
-		return
+		return nil
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return
+		return nil
 	}
 	_ = ctx
 
@@ -2260,8 +2266,13 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 	existing := m.auths[id]
 	if existing == nil {
 		m.mu.Unlock()
-		return
+		return nil
 	}
+	if expected != nil && !sameXAICredentialToken(existing, expected) {
+		m.mu.Unlock()
+		return nil
+	}
+	removed := existing.Clone()
 	provider := strings.TrimSpace(existing.Provider)
 	delete(m.auths, id)
 	if m.modelPoolOffsets != nil {
@@ -2295,6 +2306,7 @@ func (m *Manager) Remove(ctx context.Context, id string) {
 		}
 	}
 	m.persistCooldownStates(ctx)
+	return removed
 }
 
 func (m *Manager) invalidateSessionAffinity(authID string) {
@@ -3918,8 +3930,116 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
 	}
 
+	if authSnapshot != nil && shouldDeleteInvalidXAIGrokCLICredential(authSnapshot, result) {
+		m.deleteInvalidXAIGrokCLICredential(ctx, authSnapshot)
+	}
+
 	m.hook.OnResult(ctx, result)
 	m.publishErrorEvent(result, authSnapshot)
+}
+
+func shouldDeleteInvalidXAIGrokCLICredential(auth *Auth, result Result) bool {
+	if auth == nil || result.Success || result.Error == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "xai") {
+		return false
+	}
+
+	message := strings.ToLower(strings.TrimSpace(result.Error.Message))
+	statusCode := statusCodeFromResult(result.Error)
+	if statusCode != http.StatusUnauthorized && (statusCode != 0 || !strings.Contains(message, "status_code=401")) {
+		return false
+	}
+	requiredFragments := [...]string{
+		"invalid or expired credentials",
+		"auth_kind=bearer",
+		"x_xai_token_auth=xai-grok-cli",
+		"upstream=permissiondenied",
+		"reason=no auth context",
+	}
+	for _, fragment := range requiredFragments {
+		if !strings.Contains(message, fragment) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Manager) deleteInvalidXAIGrokCLICredential(ctx context.Context, auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+
+	deleteCtx := ctx
+	if deleteCtx == nil {
+		deleteCtx = context.Background()
+	} else {
+		deleteCtx = context.WithoutCancel(deleteCtx)
+	}
+	removed := m.removeRuntimeAuth(deleteCtx, auth.ID, auth)
+	if removed == nil {
+		logEntryWithRequestID(deleteCtx).WithFields(log.Fields{
+			"auth_id":  auth.ID,
+			"provider": auth.Provider,
+		}).Info("skipped invalid xAI credential deletion because the credential was refreshed or already removed")
+		return
+	}
+
+	deleteID := persistentAuthDeleteID(removed)
+	m.mu.RLock()
+	store := m.store
+	m.mu.RUnlock()
+
+	entry := logEntryWithRequestID(deleteCtx).WithFields(log.Fields{
+		"auth_id":  removed.ID,
+		"provider": removed.Provider,
+	})
+	if store != nil && deleteID != "" {
+		if errDelete := store.Delete(deleteCtx, deleteID); errDelete != nil {
+			entry.WithError(errDelete).Error("failed to delete permanently invalid xAI Grok CLI credential from storage")
+		} else {
+			entry.Warn("deleted permanently invalid xAI Grok CLI credential after upstream 401")
+		}
+	} else {
+		entry.Warn("removed permanently invalid xAI Grok CLI credential from runtime after upstream 401")
+	}
+
+	registry.GetGlobalRegistry().UnregisterClient(removed.ID)
+}
+
+func persistentAuthDeleteID(auth *Auth) string {
+	if auth == nil || IsConfigAPIKeyAuth(auth) || IsPluginVirtualAuth(auth) {
+		return ""
+	}
+	if strings.EqualFold(authAttribute(auth, AttributeRuntimeOnly), "true") {
+		return ""
+	}
+	if fileName := strings.TrimSpace(auth.FileName); fileName != "" {
+		return fileName
+	}
+	if path := authAttribute(auth, AttributePath); path != "" {
+		return path
+	}
+	if id := strings.TrimSpace(auth.ID); strings.HasSuffix(strings.ToLower(id), ".json") {
+		return id
+	}
+	return ""
+}
+
+func sameXAICredentialToken(current, expected *Auth) bool {
+	if current == nil || expected == nil {
+		return false
+	}
+	currentToken := authAttribute(current, AttributeAPIKey)
+	if currentToken == "" {
+		currentToken = authMetadataString(current, "access_token")
+	}
+	expectedToken := authAttribute(expected, AttributeAPIKey)
+	if expectedToken == "" {
+		expectedToken = authMetadataString(expected, "access_token")
+	}
+	return currentToken != "" && currentToken == expectedToken
 }
 
 func (m *Manager) recordAvailabilityNeutralResult(ctx context.Context, result Result) {
