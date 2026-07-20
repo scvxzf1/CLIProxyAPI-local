@@ -86,3 +86,44 @@ func TestMiddlewareSetsSupportPluginHeader(t *testing.T) {
 		}
 	})
 }
+
+func TestGetUsageKeeperStatusBootstrapsFromManagementHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name   string
+		header string
+		value  string
+		want   string
+	}{
+		{name: "bearer authorization", header: "Authorization", value: "Bearer bearer-secret", want: "bearer-secret"},
+		{name: "raw authorization", header: "Authorization", value: "raw-secret", want: "raw-secret"},
+		{name: "management header", header: "X-Management-Key", value: "header-secret", want: "header-secret"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var ensuredWith string
+			h := &Handler{
+				usageKeeperEnsure: func(managementKey string) map[string]any {
+					ensuredWith = managementKey
+					return map[string]any{"enabled": true, "running": true}
+				},
+			}
+
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodGet, "/v0/management/usage-keeper/status", nil)
+			c.Request.Header.Set(tt.header, tt.value)
+
+			h.GetUsageKeeperStatus(c)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+			}
+			if ensuredWith != tt.want {
+				t.Fatalf("ensure key = %q, want %q", ensuredWith, tt.want)
+			}
+		})
+	}
+}

@@ -177,10 +177,7 @@ func (h *Handler) GetUsageKeeperStatus(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler unavailable"})
 		return
 	}
-	provided := strings.TrimSpace(c.GetHeader("Authorization"))
-	if len(provided) > 7 && strings.EqualFold(provided[:7], "Bearer ") {
-		provided = strings.TrimSpace(provided[7:])
-	}
+	provided := managementKeyFromRequest(c)
 	if provided != "" && h.usageKeeperEnsure != nil {
 		status := h.usageKeeperEnsure(provided)
 		if status == nil {
@@ -199,6 +196,23 @@ func (h *Handler) GetUsageKeeperStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, status)
+}
+
+func managementKeyFromRequest(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	provided := strings.TrimSpace(c.GetHeader("Authorization"))
+	if provided != "" {
+		parts := strings.SplitN(provided, " ", 2)
+		if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+			provided = strings.TrimSpace(parts[1])
+		}
+	}
+	if provided == "" {
+		provided = strings.TrimSpace(c.GetHeader("X-Management-Key"))
+	}
+	return provided
 }
 
 // SetPluginHost updates the plugin host used by plugin-backed management endpoints.
@@ -333,19 +347,8 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
 
-		// Accept either Authorization: Bearer <key> or X-Management-Key
-		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
-			parts := strings.SplitN(ah, " ", 2)
-			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
-				provided = parts[1]
-			} else {
-				provided = ah
-			}
-		}
-		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
-		}
+		// Accept either Authorization: Bearer <key> or X-Management-Key.
+		provided := managementKeyFromRequest(c)
 
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey(clientIP, localClient, provided)
 		if !allowed {
