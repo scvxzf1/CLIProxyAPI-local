@@ -71,9 +71,11 @@ const (
 	xaiUsingAPIAttr = "using_api"
 )
 
-// Always inject native x_search when the client did not declare it so Grok can
-// run X Search server-side. Internal subtool traces are still filtered downstream
-// when this native tool is present (see filterInternalXSearch).
+// Inject native x_search only when the client did not declare any local
+// callable tools (function/custom). Forced injection on top of client tools
+// steals the tool loop (native X Search / web_search_call instead of the
+// client's function_call) — see issue #4339. Internal subtool traces are still
+// filtered downstream when this native tool is present (see filterInternalXSearch).
 var xaiXSearchToolJSON = []byte(`{"type":"x_search"}`)
 
 // XAIExecutor is a stateless executor for xAI Grok's Responses API.
@@ -1332,24 +1334,79 @@ func sanitizeXAIResponsesBody(body []byte, model string) []byte {
 }
 
 // ensureXAINativeXSearchTool appends {"type":"x_search"} when the final tools
-// list does not already include native X Search. When tool_choice restricts the
-// model to allowed_tools, x_search is also added there (without duplicates) so
-// Grok can select the injected tool. HTTP and websocket executors both prepare
+// list does not already include native X Search and the client has not declared
+// any local callable tools. Client function/custom tools must keep ownership of
+// the tool loop; injecting x_search next to them causes Grok to emit native
+// search traces instead of function_call (issue #4339) and makes agent clients
+// (Codex shell/spawn_agent, pi-agent web_search, …) look "misrouted" to X Search.
+//
+// When tool_choice restricts the model to allowed_tools and we did inject (or
+// the client already declared x_search), x_search is also added there without
+// duplicates so Grok can select it. HTTP and websocket executors both prepare
 // payloads through prepareResponsesRequestTo, so this runs once before the body
 // is submitted upstream.
 func ensureXAINativeXSearchTool(body []byte) []byte {
 	if !gjson.ValidBytes(body) {
 		return body
 	}
-	if !xaiRequestHasNativeXSearch(body) {
-		tools := gjson.GetBytes(body, "tools")
-		if !tools.Exists() || !tools.IsArray() {
-			body, _ = sjson.SetRawBytes(body, "tools", []byte(`[{"type":"x_search"}]`))
-		} else {
-			body, _ = sjson.SetRawBytes(body, "tools.-1", xaiXSearchToolJSON)
-		}
+	if xaiRequestHasNativeXSearch(body) {
+		// Client already opted into native X Search; only keep allowed_tools in sync.
+		return ensureXAINativeXSearchAllowedTools(body)
+	}
+	if xaiRequestHasClientCallableTools(body) {
+		// Leave client tools alone — do not expand tools / allowed_tools with x_search.
+		return body
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		body, _ = sjson.SetRawBytes(body, "tools", []byte(`[{"type":"x_search"}]`))
+	} else {
+		body, _ = sjson.SetRawBytes(body, "tools.-1", xaiXSearchToolJSON)
 	}
 	return ensureXAINativeXSearchAllowedTools(body)
+}
+
+// xaiRequestHasClientCallableTools reports whether the request still carries any
+// tools that the client must execute locally (function / custom, including those
+// nested under residual additional_tools items). Host-side tools such as
+// web_search, x_search, and image_generation do not count.
+func xaiRequestHasClientCallableTools(body []byte) bool {
+	if xaiToolArrayHasClientCallableTools(gjson.GetBytes(body, "tools")) {
+		return true
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.IsArray() {
+		return false
+	}
+	for _, item := range input.Array() {
+		if item.Get("type").String() != "additional_tools" {
+			continue
+		}
+		if xaiToolArrayHasClientCallableTools(item.Get("tools")) {
+			return true
+		}
+	}
+	return false
+}
+
+func xaiToolArrayHasClientCallableTools(tools gjson.Result) bool {
+	if !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case xaiFunctionToolType, xaiCustomToolType:
+			if strings.TrimSpace(tool.Get("name").String()) != "" {
+				return true
+			}
+		case xaiNamespaceToolType:
+			// Defensive: namespaces should already be flattened by normalizeXAITools.
+			if xaiToolArrayHasClientCallableTools(tool.Get("tools")) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ensureXAINativeXSearchAllowedTools appends x_search to tool_choice.tools when
@@ -1751,6 +1808,15 @@ func normalizeXAITool(tool gjson.Result, namespaceName string) ([]byte, bool, bo
 			return nil, false, false
 		}
 		raw = updatedTool
+		// Freeform custom tools may carry a `format` field that xAI rejects on
+		// function tools (ModelInput 422). Strip it after the type rewrite.
+		if gjson.GetBytes(raw, "format").Exists() {
+			updatedTool, errDel := sjson.DeleteBytes(raw, "format")
+			if errDel != nil {
+				return nil, false, false
+			}
+			raw = updatedTool
+		}
 		toolType = xaiFunctionToolType
 		changed = true
 	}
